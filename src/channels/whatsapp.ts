@@ -246,20 +246,39 @@ export function computeIsMention(isGroup: boolean, botMentionedInGroup: boolean)
   return botMentionedInGroup ? true : undefined;
 }
 
-/** Map file extension to Baileys media message type. */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function buildMediaMessage(data: Buffer, filename: string, ext: string, caption?: string): any {
-  const imageExts = ['.jpg', '.jpeg', '.png', '.gif', '.webp'];
-  const videoExts = ['.mp4', '.mov', '.avi', '.mkv'];
-  const audioExts = ['.mp3', '.ogg', '.m4a', '.wav', '.aac', '.opus'];
+const IMAGE_EXTS = ['.jpg', '.jpeg', '.png', '.gif', '.webp'];
+const VIDEO_EXTS = ['.mp4', '.mov', '.avi', '.mkv'];
+const AUDIO_EXTS = ['.mp3', '.ogg', '.m4a', '.wav', '.aac', '.opus'];
+// Opus-in-Ogg is the codec WhatsApp uses for voice notes. Sending these with
+// `ptt: true` makes the message render as a push-to-talk voice message rather
+// than a generic audio/file attachment.
+const VOICE_EXTS = ['.ogg', '.opus'];
 
-  if (imageExts.includes(ext)) {
+/**
+ * Whether the Baileys media type for this extension can carry a text caption.
+ * Images, videos and documents can; audio (including voice notes) cannot —
+ * WhatsApp drops a caption on an audio message. The caller uses this so it
+ * doesn't mark the caption "consumed" and silently swallow accompanying text.
+ */
+export function mediaAcceptsCaption(ext: string): boolean {
+  return !AUDIO_EXTS.includes(ext);
+}
+
+/** Map a file extension to a Baileys media message payload. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function buildMediaMessage(data: Buffer, filename: string, ext: string, caption?: string): any {
+  if (IMAGE_EXTS.includes(ext)) {
     return { image: data, caption, mimetype: `image/${ext.slice(1) === 'jpg' ? 'jpeg' : ext.slice(1)}` };
   }
-  if (videoExts.includes(ext)) {
+  if (VIDEO_EXTS.includes(ext)) {
     return { video: data, caption, mimetype: `video/${ext.slice(1)}` };
   }
-  if (audioExts.includes(ext)) {
+  if (VOICE_EXTS.includes(ext)) {
+    // Voice note (push-to-talk). Audio messages never carry a caption.
+    return { audio: data, mimetype: 'audio/ogg; codecs=opus', ptt: true };
+  }
+  if (AUDIO_EXTS.includes(ext)) {
+    // Music / non-voice audio — playable attachment, not a voice note.
     return { audio: data, mimetype: `audio/${ext.slice(1) === 'mp3' ? 'mpeg' : ext.slice(1)}` };
   }
   // Default: send as document
@@ -865,15 +884,19 @@ registerChannelAdapter('whatsapp', {
 
         if (!text && !hasFiles) return;
 
-        // Send file attachments (first file gets the caption, rest are captionless)
+        // Send file attachments. The first caption-capable file (image/video/
+        // document) carries the message text as its caption; audio/voice notes
+        // can't hold a caption, so the text falls through to a separate message
+        // below. `lastMsgId` is returned so delivery records a real platform id.
         if (hasFiles) {
           let captionUsed = false;
+          let lastMsgId: string | undefined;
           for (const file of message.files!) {
             try {
               const ext = path.extname(file.filename).toLowerCase();
               let caption: string | undefined;
               let captionMentions: string[] | undefined;
-              if (!captionUsed && text) {
+              if (mediaAcceptsCaption(ext) && !captionUsed && text) {
                 const formatted = formatWhatsApp(text);
                 caption = formatted.text;
                 captionMentions = formatted.mentions.length > 0 ? formatted.mentions : undefined;
@@ -883,13 +906,22 @@ registerChannelAdapter('whatsapp', {
               const sent = await sock.sendMessage(platformId, mediaMsg);
               if (sent?.key?.id && sent.message) {
                 sentMessageCache.set(sent.key.id, sent.message);
+                lastMsgId = sent.key.id;
               }
               if (caption) captionUsed = true;
             } catch (err) {
               log.error('Failed to send file', { platformId, filename: file.filename, err });
             }
           }
-          if (captionUsed) return; // Text was sent as caption
+          // If a caption carried the text, we're done. Otherwise fall through
+          // to send the text as its own message (e.g. text alongside a voice note).
+          if (captionUsed) return lastMsgId;
+          if (text) {
+            const { text: formatted, mentions } = formatWhatsApp(text);
+            const prefixed = ASSISTANT_HAS_OWN_NUMBER ? formatted : `${ASSISTANT_NAME}: ${formatted}`;
+            return sendRawMessage(platformId, prefixed, mentions);
+          }
+          return lastMsgId;
         }
 
         if (text) {
