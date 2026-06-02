@@ -25,6 +25,7 @@ import { normalizeOptions } from './channels/ask-question.js';
 import { clearOutbox, openInboundDb, openOutboundDb, readOutboxFiles } from './session-manager.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import type { OutboundFile } from './channels/adapter.js';
+import { postAsAgent, discordIdentityEnabled } from './channels/discord-webhook.js';
 import type { Session } from './types.js';
 
 const ACTIVE_POLL_MS = 1000;
@@ -353,14 +354,38 @@ async function deliverMessage(
       ? readOutboxFiles(session.agent_group_id, session.id, msg.id, content.files as string[])
       : undefined;
 
-  const platformMsgId = await deliveryAdapter.deliver(
-    msg.channel_type,
-    msg.platform_id,
-    msg.thread_id,
-    msg.kind,
-    msg.content,
-    files,
-  );
+  // Per-agent Discord identity: post a normal text/markdown reply through a
+  // per-channel webhook as the AGENT's name (not the shared bot user). Edits,
+  // cards, reactions, files-only, and non-Discord channels fall through to the
+  // bot adapter unchanged.
+  let platformMsgId: string | undefined;
+  let deliveredViaWebhook = false;
+  const replyText =
+    !content.operation && content.type !== 'ask_question' && content.type !== 'card'
+      ? (content.markdown as string) || (content.text as string)
+      : undefined;
+  const senderName = getAgentGroup(session.agent_group_id)?.name;
+  if (msg.channel_type === 'discord' && replyText && discordIdentityEnabled() && senderName) {
+    try {
+      platformMsgId = await postAsAgent(msg.platform_id, msg.thread_id, replyText, files, senderName);
+      deliveredViaWebhook = true;
+    } catch (err) {
+      log.warn('per-agent webhook post failed, falling back to bot', {
+        sessionId: session.id,
+        err: String(err),
+      });
+    }
+  }
+  if (!deliveredViaWebhook) {
+    platformMsgId = await deliveryAdapter.deliver(
+      msg.channel_type,
+      msg.platform_id,
+      msg.thread_id,
+      msg.kind,
+      msg.content,
+      files,
+    );
+  }
   log.info('Message delivered', {
     id: msg.id,
     channelType: msg.channel_type,
