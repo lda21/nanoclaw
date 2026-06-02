@@ -14,6 +14,8 @@ import {
   type RoutingContext,
 } from './formatter.js';
 import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
+import { getConfig } from './config.js';
+import { flushTraces, tracingEnabled, withTrace, type TurnTraceAttributes } from './tracing/index.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
 
 const POLL_INTERVAL_MS = 1000;
@@ -218,25 +220,33 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
 
-    const query = config.provider.query({
-      prompt,
-      continuation,
-      cwd: config.cwd,
-      systemContext: config.systemContext,
-    });
-
     // Process the query while concurrently polling for new messages
     const skippedSet = new Set(skipped);
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
     // Publish the batch's in_reply_to so MCP tools (send_message, send_file)
     // can stamp it on outbound rows — needed for a2a return-path routing.
     setCurrentInReplyTo(routing.inReplyTo);
+
+    // Wrap the whole turn in a Langfuse trace (no-op when tracing is disabled).
+    // provider.query() MUST run inside the active context so the provider's
+    // generation/tool spans nest under this `agent-turn` root.
+    const traceAttrs: TurnTraceAttributes = tracingEnabled
+      ? buildTurnTraceAttributes(keep, routing, prompt, config.providerName)
+      : {};
     try {
-      const result = await processQuery(query, routing, processingIds, config.providerName);
-      if (result.continuation && result.continuation !== continuation) {
-        continuation = result.continuation;
-        setContinuation(config.providerName, continuation);
-      }
+      await withTrace('agent-turn', traceAttrs, async () => {
+        const query = config.provider.query({
+          prompt,
+          continuation,
+          cwd: config.cwd,
+          systemContext: config.systemContext,
+        });
+        const result = await processQuery(query, routing, processingIds, config.providerName);
+        if (result.continuation && result.continuation !== continuation) {
+          continuation = result.continuation;
+          setContinuation(config.providerName, continuation);
+        }
+      });
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       log(`Query error: ${errMsg}`);
@@ -261,6 +271,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       });
     } finally {
       clearCurrentInReplyTo();
+      // Flush this turn's spans now so they survive a kill before the next turn.
+      await flushTraces();
     }
 
     // Ensure completed even if processQuery ended without a result event
@@ -268,6 +280,65 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     markCompleted(processingIds);
     log(`Completed ${ids.length} message(s)`);
   }
+}
+
+/** Best-effort sender id for the trace `userId`, from the batch's message content. */
+function extractSenderIdFromBatch(messages: MessageInRow[]): string | undefined {
+  for (const m of messages) {
+    try {
+      const c = JSON.parse(m.content) as { senderId?: string; author?: { userId?: string } };
+      const id = c?.senderId || c?.author?.userId;
+      if (id) return id;
+    } catch {
+      /* non-JSON content (e.g. task rows) — skip */
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Build Langfuse trace attributes for one turn from already-available context.
+ * Only called when tracing is enabled. Reads agent-group identity from the
+ * loaded config singleton (falls back gracefully if config isn't loaded, e.g.
+ * in tests).
+ */
+function buildTurnTraceAttributes(
+  messages: MessageInRow[],
+  routing: RoutingContext,
+  prompt: string,
+  providerName: string,
+): TurnTraceAttributes {
+  let agentGroupId = '';
+  let groupName = '';
+  try {
+    const cfg = getConfig();
+    agentGroupId = cfg.agentGroupId;
+    groupName = cfg.groupName;
+  } catch {
+    /* config not loaded — emit a trace without group identity */
+  }
+
+  const tags = [providerName, routing.channelType ?? undefined, groupName || undefined].filter(
+    (t): t is string => Boolean(t),
+  );
+
+  const metadata: Record<string, string> = {
+    messageCount: String(messages.length),
+    kinds: [...new Set(messages.map((m) => m.kind))].join(','),
+  };
+  if (agentGroupId) metadata.agentGroupId = agentGroupId;
+  if (routing.platformId) metadata.platformId = routing.platformId;
+  if (routing.threadId) metadata.threadId = routing.threadId;
+  if (routing.channelType) metadata.channelType = routing.channelType;
+
+  return {
+    sessionId: `${agentGroupId || 'agent'}:${routing.threadId ?? 'main'}`,
+    userId: extractSenderIdFromBatch(messages),
+    tags,
+    metadata,
+    input: prompt,
+    traceName: `nanoclaw.${groupName || 'agent'}.agent_turn`,
+  };
 }
 
 /**

@@ -11,7 +11,15 @@
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.154",
     "@anthropic-ai/sdk": "^0.100.0",
+    "@arizeai/openinference-instrumentation-claude-agent-sdk": "0.2.6",
+    "@langfuse/otel": "5.4.1",
+    "@langfuse/tracing": "5.4.1",
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@opentelemetry/api": "1.9.0",
+    "@opentelemetry/core": "2.7.1",
+    "@opentelemetry/exporter-trace-otlp-http": "0.218.0",
+    "@opentelemetry/sdk-trace-base": "2.7.1",
+    "@opentelemetry/sdk-trace-node": "2.7.1",
     "cron-parser": "^5.0.0",
     "zod": "^4.0.0"
   },

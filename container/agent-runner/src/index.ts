@@ -32,12 +32,34 @@ import { buildSystemPromptAddendum } from './destinations.js';
 import './providers/index.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
 import { runPollLoop } from './poll-loop.js';
+import { flushTraces, shutdownTracing, tracingEnabled } from './tracing/index.js';
 
 function log(msg: string): void {
   console.error(`[agent-runner] ${msg}`);
 }
 
 const CWD = '/workspace/agent';
+
+// Flush buffered Langfuse spans before the container dies. tini forwards
+// SIGTERM to bun on container stop/restart; without this, the last turn's
+// spans (buffered by the batch processor) would be lost. Bounded internally
+// so a slow/unreachable Langfuse can't delay shutdown past the host's
+// heartbeat tolerance. No-op when tracing is disabled.
+if (tracingEnabled) {
+  let shuttingDown = false;
+  const onSignal = (signal: NodeJS.Signals): void => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log(`Received ${signal} — flushing traces`);
+    void (async () => {
+      await flushTraces();
+      await shutdownTracing();
+      process.exit(0);
+    })();
+  };
+  process.on('SIGTERM', onSignal);
+  process.on('SIGINT', onSignal);
+}
 
 async function main(): Promise<void> {
   const config = loadConfig();

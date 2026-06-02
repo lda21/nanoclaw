@@ -15,6 +15,12 @@ import {
   CONTAINER_INSTALL_LABEL,
   DATA_DIR,
   GROUPS_DIR,
+  LANGFUSE_BASE_URL,
+  LANGFUSE_HOST_GATEWAY,
+  LANGFUSE_PUBLIC_KEY,
+  LANGFUSE_SECRET_KEY,
+  LANGFUSE_TRACE_REDACT_CONTENT,
+  LANGFUSE_TRACING_ENVIRONMENT,
   ONECLI_API_KEY,
   ONECLI_URL,
   TIMEZONE,
@@ -396,6 +402,61 @@ function syncSkillSymlinks(claudeDir: string, containerConfig: import('./contain
   }
 }
 
+/** Decide whether to map the Langfuse hostname to the Docker host gateway. */
+function shouldMapLangfuseHostGateway(host: string): boolean {
+  const override = (LANGFUSE_HOST_GATEWAY || '').toLowerCase();
+  if (override === 'true') return true;
+  if (override === 'false') return false;
+  // Auto: self-hosted instances whose name won't resolve inside the container.
+  // (cloud.langfuse.com resolves via public DNS and must NOT be remapped.)
+  return (
+    host.endsWith('.ts.net') || // Tailscale MagicDNS
+    host.endsWith('.local') || // mDNS
+    host === 'localhost' ||
+    /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(host)
+  );
+}
+
+/**
+ * When Langfuse keys are configured, inject them into the container and make a
+ * self-hosted instance reachable: bypass the OneCLI proxy for the Langfuse host
+ * (NO_PROXY) and, for non-public hostnames, map them to the host gateway so the
+ * OTLP export resolves + TLS-validates. No-op when keys are absent.
+ */
+function appendLangfuseArgs(args: string[]): void {
+  if (!LANGFUSE_PUBLIC_KEY || !LANGFUSE_SECRET_KEY || !LANGFUSE_BASE_URL) return;
+
+  args.push('-e', `LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY}`);
+  args.push('-e', `LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY}`);
+  args.push('-e', `LANGFUSE_BASE_URL=${LANGFUSE_BASE_URL}`);
+  if (LANGFUSE_TRACING_ENVIRONMENT) args.push('-e', `LANGFUSE_TRACING_ENVIRONMENT=${LANGFUSE_TRACING_ENVIRONMENT}`);
+  if (LANGFUSE_TRACE_REDACT_CONTENT) args.push('-e', `LANGFUSE_TRACE_REDACT_CONTENT=${LANGFUSE_TRACE_REDACT_CONTENT}`);
+
+  let host: string;
+  try {
+    host = new URL(LANGFUSE_BASE_URL).hostname;
+  } catch {
+    log.warn('Invalid LANGFUSE_BASE_URL — skipping Langfuse networking setup', { LANGFUSE_BASE_URL });
+    return;
+  }
+  if (!host) return;
+
+  // Route trace export around the OneCLI vault proxy. Merge into any NO_PROXY
+  // OneCLI already pushed rather than clobber it (Docker keeps the last -e).
+  const idx = args.findIndex((a, i) => i > 0 && args[i - 1] === '-e' && a.startsWith('NO_PROXY='));
+  if (idx >= 0) {
+    const existing = args[idx].slice('NO_PROXY='.length);
+    if (!existing.split(',').includes(host)) args[idx] = `NO_PROXY=${existing},${host}`;
+  } else {
+    args.push('-e', `NO_PROXY=${host}`);
+  }
+
+  if (shouldMapLangfuseHostGateway(host)) {
+    args.push('--add-host', `${host}:host-gateway`);
+    log.info('Langfuse host mapped to host-gateway', { host });
+  }
+}
+
 async function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
@@ -431,6 +492,10 @@ async function buildContainerArgs(
     throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');
   }
   log.info('OneCLI gateway applied', { containerName });
+
+  // Langfuse tracing — pass keys + make a self-hosted instance reachable.
+  // Done AFTER OneCLI so our NO_PROXY merges into whatever proxy env it set.
+  appendLangfuseArgs(args);
 
   // Host gateway
   args.push(...hostGatewayArgs());

@@ -2,9 +2,10 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
+import { type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
+import { getClaudeQuery } from '../tracing/index.js';
 import { registerProvider } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, McpServerConfig, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 
@@ -396,7 +397,9 @@ export class ClaudeProvider implements AgentProvider {
 
     const instructions = input.systemContext?.instructions;
 
-    const sdkResult = sdkQuery({
+    // Routed through the tracing module so the OpenInference instrumentation is
+    // applied when Langfuse tracing is enabled (raw SDK query otherwise).
+    const sdkResult = getClaudeQuery()({
       prompt: stream,
       options: {
         cwd: input.cwd,
