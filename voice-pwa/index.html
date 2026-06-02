@@ -96,7 +96,7 @@
     const statusDot = document.getElementById('status-dot');
 
     let mediaRecorder, audioChunks = [], isRecording = false, isProcessing = false;
-    let currentAudio = null;
+    let sessionId = localStorage.getItem('voiceSessionId') || null;
 
     function setStatus(text, dot) { statusLabel.textContent = text; statusDot.className = dot || ''; }
     function addBubble(text, type) {
@@ -140,10 +140,15 @@
       const blob = new Blob(audioChunks, { type: mimeType });
       const form = new FormData();
       form.append('audio', blob, mimeType.includes('mp4') ? 'audio.mp4' : 'audio.webm');
+      if (sessionId) form.append('sessionId', sessionId);
       try {
         const res = await fetch('/voice', { method: 'POST', body: form });
         const data = await res.json();
         if (!res.ok || data.error) throw new Error(data.error || `שגיאה ${res.status}`);
+        if (data.sessionId && data.sessionId !== sessionId) {
+          sessionId = data.sessionId;
+          localStorage.setItem('voiceSessionId', sessionId);
+        }
         addBubble(data.text, 'user');
         addBubble(data.replyText, 'nano');
         speechSynthesis.cancel();
