@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#000000">
+  <title>Nano — קול</title>
+  <link rel="manifest" href="/manifest.json">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #000; --surface: #111; --border: #222; --text: #fff; --text2: #888;
+      --green: #30d158; --red: #ff453a; --blue: #0a84ff;
+    }
+    html, body {
+      height: 100%; background: var(--bg); color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      -webkit-font-smoothing: antialiased; overscroll-behavior: none;
+      user-select: none; -webkit-user-select: none;
+    }
+    body {
+      display: flex; flex-direction: column; height: 100dvh;
+      padding: env(safe-area-inset-top,16px) env(safe-area-inset-right,16px)
+               env(safe-area-inset-bottom,16px) env(safe-area-inset-left,16px);
+    }
+    header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 12px 0 8px; flex-shrink: 0;
+    }
+    header h1 { font-size: 17px; font-weight: 600; letter-spacing: -0.3px; }
+    #status-dot {
+      width: 10px; height: 10px; border-radius: 50%; background: var(--text2);
+      transition: background 0.3s;
+    }
+    #status-dot.ready    { background: var(--green); }
+    #status-dot.error    { background: var(--red); }
+    #status-dot.busy     { background: var(--blue); animation: blink 1s infinite; }
+    #status-dot.listening{ background: var(--blue); box-shadow: 0 0 0 4px rgba(10,132,255,0.25); }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.4} }
+    #transcript {
+      flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch;
+      display: flex; flex-direction: column; gap: 10px; padding: 8px 0;
+    }
+    .bubble {
+      max-width: 85%; padding: 10px 14px; border-radius: 18px;
+      font-size: 15px; line-height: 1.5; word-break: break-word;
+      animation: pop-in 0.15s ease-out;
+    }
+    @keyframes pop-in { from{opacity:0;transform:scale(0.95)} to{opacity:1;transform:scale(1)} }
+    .bubble.user { align-self: flex-start; background: var(--blue); color: #fff; border-bottom-right-radius: 4px; }
+    .bubble.nano { align-self: flex-end;   background: var(--surface); color: var(--text); border-bottom-left-radius: 4px; }
+    .bubble.err  { align-self: center; background: rgba(255,69,58,0.12); color: var(--red); font-size: 13px; text-align: center; }
+    #status-label { text-align: center; font-size: 13px; color: var(--text2); padding: 6px 0; min-height: 28px; flex-shrink: 0; }
+    #mic-btn {
+      flex-shrink: 0; align-self: center; width: 88px; height: 88px;
+      border-radius: 50%; border: none; background: var(--surface);
+      cursor: pointer; display: flex; align-items: center; justify-content: center;
+      margin: 8px 0 4px; transition: transform 0.1s, background 0.2s, box-shadow 0.2s;
+      -webkit-tap-highlight-color: transparent; touch-action: none;
+    }
+    #mic-btn.listening { background: var(--blue); transform: scale(0.94); box-shadow: 0 0 0 12px rgba(10,132,255,0.2); }
+    #mic-btn.processing { background: var(--surface); animation: pulse 1s infinite; }
+    @keyframes pulse { 0%,100%{box-shadow:0 0 0 0 rgba(255,255,255,0.1)} 50%{box-shadow:0 0 0 14px rgba(255,255,255,0)} }
+    #mic-btn svg { pointer-events: none; }
+    #mic-icon-proc { display: none; }
+    #hold-hint { text-align: center; font-size: 12px; color: var(--text2); margin-bottom: 4px; flex-shrink: 0; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Nano</h1>
+    <div id="status-dot"></div>
+  </header>
+  <div id="transcript" aria-live="polite"></div>
+  <div id="status-label">טוען…</div>
+  <button id="mic-btn" aria-label="לחץ לדיבור" aria-pressed="false">
+    <svg id="mic-icon" width="36" height="36" viewBox="0 0 24 24" fill="none">
+      <rect x="9" y="2" width="6" height="13" rx="3" fill="white"/>
+      <path d="M5 11a7 7 0 0014 0" stroke="white" stroke-width="2" stroke-linecap="round"/>
+      <line x1="12" y1="18" x2="12" y2="22" stroke="white" stroke-width="2" stroke-linecap="round"/>
+      <line x1="9" y1="22" x2="15" y2="22" stroke="white" stroke-width="2" stroke-linecap="round"/>
+    </svg>
+    <svg id="mic-icon-proc" width="36" height="36" viewBox="0 0 24 24" fill="none">
+      <circle cx="12" cy="12" r="8" stroke="#888" stroke-width="2"/>
+      <line x1="8" y1="12" x2="16" y2="12" stroke="#888" stroke-width="2" stroke-linecap="round"/>
+    </svg>
+  </button>
+  <div id="hold-hint">לחץ והחזק לדיבור</div>
+
+  <script>
+    const micBtn = document.getElementById('mic-btn');
+    const transcript = document.getElementById('transcript');
+    const statusLabel = document.getElementById('status-label');
+    const statusDot = document.getElementById('status-dot');
+
+    let mediaRecorder, audioChunks = [], isRecording = false, isProcessing = false;
+    let currentAudio = null;
+
+    function setStatus(text, dot) { statusLabel.textContent = text; statusDot.className = dot || ''; }
+    function addBubble(text, type) {
+      const div = document.createElement('div');
+      div.className = `bubble ${type}`; div.textContent = text;
+      transcript.appendChild(div); transcript.scrollTop = transcript.scrollHeight;
+    }
+    function setMic(state) {
+      micBtn.className = state;
+      micBtn.setAttribute('aria-pressed', state === 'listening');
+      document.getElementById('mic-icon').style.display = state === 'processing' ? 'none' : '';
+      document.getElementById('mic-icon-proc').style.display = state === 'processing' ? '' : 'none';
+    }
+
+    async function startRecording() {
+      if (isRecording || isProcessing) return;
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        audioChunks = [];
+        const mimeType = ['audio/webm;codecs=opus','audio/webm','audio/mp4','audio/ogg']
+          .find(t => MediaRecorder.isTypeSupported(t)) || '';
+        mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
+        mediaRecorder.ondataavailable = e => { if (e.data.size > 0) audioChunks.push(e.data); };
+        mediaRecorder.onstop = () => { stream.getTracks().forEach(t => t.stop()); handleRecordingDone(); };
+        mediaRecorder.start();
+        isRecording = true;
+        setMic('listening'); setStatus('מקשיב…', 'listening');
+        if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+      } catch { setStatus('אין גישה למיקרופון', 'error'); }
+    }
+
+    function stopRecording() {
+      if (!isRecording || !mediaRecorder) return;
+      isRecording = false; mediaRecorder.stop();
+    }
+
+    async function handleRecordingDone() {
+      if (audioChunks.length === 0) { setStatus('מוכן', 'ready'); setMic(''); return; }
+      isProcessing = true; setMic('processing'); setStatus('מעבד…', 'busy');
+      const mimeType = mediaRecorder.mimeType || 'audio/webm';
+      const blob = new Blob(audioChunks, { type: mimeType });
+      const form = new FormData();
+      form.append('audio', blob, mimeType.includes('mp4') ? 'audio.mp4' : 'audio.webm');
+      try {
+        const res = await fetch('/voice', { method: 'POST', body: form });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || `שגיאה ${res.status}`);
+        addBubble(data.text, 'user');
+        addBubble(data.replyText, 'nano');
+        currentAudio = new Audio(data.audioUrl);
+        currentAudio.play().catch(() => {});
+        currentAudio.onended = () => { currentAudio = null; };
+        setStatus('מוכן', 'ready');
+      } catch (e) {
+        addBubble(e.message, 'err'); setStatus('שגיאה — נסה שוב', 'error');
+      } finally { isProcessing = false; setMic(''); }
+    }
+
+    micBtn.addEventListener('touchstart', e => { e.preventDefault(); startRecording(); }, { passive: false });
+    micBtn.addEventListener('touchend',   e => { e.preventDefault(); stopRecording(); },  { passive: false });
+    micBtn.addEventListener('touchcancel',e => { e.preventDefault(); stopRecording(); },  { passive: false });
+    micBtn.addEventListener('mousedown',  e => { e.preventDefault(); startRecording(); });
+    micBtn.addEventListener('mouseup',    () => stopRecording());
+    micBtn.addEventListener('mouseleave', () => { if (isRecording) stopRecording(); });
+
+    setStatus('מוכן', 'ready');
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
+  </script>
+</body>
+</html>
