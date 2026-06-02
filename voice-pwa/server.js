@@ -1,16 +1,25 @@
 /**
- * Voice Gateway — audio pipeline: browser → Groq Whisper STT → Groq LLM → browser TTS
+ * Voice Gateway — browser → Groq Whisper STT → Groq LLM (with session history) → browser TTS
  *
- * POST /voice — receives audio blob, returns { text, replyText }
+ * POST /voice — receives audio + sessionId, returns { text, replyText, sessionId }
  * GET  /      — serves PWA HTML
  */
 
 import { readFileSync } from 'fs';
+import { randomUUID } from 'crypto';
 
 const PORT = parseInt(process.env.PORT || '3000');
 const ROOT = '/workspace/agent';
 
 const SYSTEM_PROMPT = 'אתה עוזר אישי עברי בשם ננו. עונה בקצרה בעברית. המשתמש הוא דן-אל.';
+const MAX_HISTORY = 20; // per-session message cap (10 turns)
+
+const sessions = new Map(); // sessionId → messages[]
+
+function getHistory(sessionId) {
+  if (!sessions.has(sessionId)) sessions.set(sessionId, []);
+  return sessions.get(sessionId);
+}
 
 async function transcribeGroq(audioBuffer, mimeType) {
   const form = new FormData();
@@ -23,11 +32,14 @@ async function transcribeGroq(audioBuffer, mimeType) {
     body: form,
   });
   if (!res.ok) throw new Error(`Groq STT ${res.status}: ${await res.text()}`);
-  const data = await res.json();
-  return data.text?.trim() || '';
+  return (await res.json()).text?.trim() || '';
 }
 
-async function askGroq(userText) {
+async function askGroq(sessionId, userText) {
+  const history = getHistory(sessionId);
+  history.push({ role: 'user', content: userText });
+  while (history.length > MAX_HISTORY) history.shift();
+
   const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: {
@@ -39,13 +51,14 @@ async function askGroq(userText) {
       max_tokens: 300,
       messages: [
         { role: 'system', content: SYSTEM_PROMPT },
-        { role: 'user', content: userText },
+        ...history,
       ],
     }),
   });
   if (!res.ok) throw new Error(`Groq LLM ${res.status}: ${await res.text()}`);
-  const data = await res.json();
-  return data.choices?.[0]?.message?.content?.trim() || '';
+  const reply = (await res.json()).choices?.[0]?.message?.content?.trim() || '';
+  history.push({ role: 'assistant', content: reply });
+  return reply;
 }
 
 const srv = Bun.serve({
@@ -76,17 +89,18 @@ const srv = Bun.serve({
         const audioFile = form.get('audio');
         if (!audioFile) return Response.json({ error: 'No audio field' }, { status: 400 });
 
+        const sessionId = form.get('sessionId') || randomUUID();
         const audioBuffer = await audioFile.arrayBuffer();
         const mimeType = audioFile.type || 'audio/webm';
 
         const text = await transcribeGroq(audioBuffer, mimeType);
         if (!text) return Response.json({ error: 'Could not transcribe audio' }, { status: 422 });
-        console.log(`[STT] "${text}"`);
+        console.log(`[STT][${sessionId.slice(0,8)}] "${text}"`);
 
-        const replyText = await askGroq(text);
-        console.log(`[LLM] "${replyText}"`);
+        const replyText = await askGroq(sessionId, text);
+        console.log(`[LLM][${sessionId.slice(0,8)}] "${replyText}"`);
 
-        return Response.json({ text, replyText });
+        return Response.json({ text, replyText, sessionId });
       } catch (e) {
         console.error('[/voice error]', e.message);
         return Response.json({ error: e.message }, { status: 500 });
