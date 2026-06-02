@@ -1,0 +1,13 @@
+{
+  "name": "Nano Voice",
+  "short_name": "Nano",
+  "description": "Voice chat with Nano",
+  "start_url": "/voice",
+  "display": "standalone",
+  "background_color": "#000000",
+  "theme_color": "#000000",
+  "orientation": "portrait",
+  "icons": [
+    { "src": "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='50' fill='%23000'/><text y='.9em' font-size='80' x='10'>🎙️</text></svg>", "sizes": "any", "type": "image/svg+xml" }
+  ]
+}
