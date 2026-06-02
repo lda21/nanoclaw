@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.nanoclaw.voice-pwa</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/usr/local/bin/voice-pwa-start.sh</string>
+  </array>
+
+  <!-- Start immediately when loaded, and on every boot -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Restart automatically if the script exits for any reason -->
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/var/log/voice-pwa.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/voice-pwa.log</string>
+
+  <!-- Give Docker time to come up before this runs on boot -->
+  <key>StartInterval</key>
+  <integer>0</integer>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+</dict>
+</plist>
