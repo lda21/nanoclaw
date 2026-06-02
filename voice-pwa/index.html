@@ -146,9 +146,10 @@
         if (!res.ok || data.error) throw new Error(data.error || `שגיאה ${res.status}`);
         addBubble(data.text, 'user');
         addBubble(data.replyText, 'nano');
-        currentAudio = new Audio(data.audioUrl);
-        currentAudio.play().catch(() => {});
-        currentAudio.onended = () => { currentAudio = null; };
+        speechSynthesis.cancel();
+        const utt = new SpeechSynthesisUtterance(data.replyText);
+        utt.lang = 'he-IL'; utt.rate = 1.0; utt.pitch = 1.0;
+        speechSynthesis.speak(utt);
         setStatus('מוכן', 'ready');
       } catch (e) {
         addBubble(e.message, 'err'); setStatus('שגיאה — נסה שוב', 'error');
