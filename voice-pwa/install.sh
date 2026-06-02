@@ -1,128 +1,48 @@
 #!/bin/bash
-# NanoClaw Voice PWA — one-shot installer
-# Run: curl <url> | sudo bash
+# NanoClaw Voice PWA — installer v2 (macOS + Docker Desktop)
+# Run: curl -sL https://raw.githubusercontent.com/lda21/nanoclaw/main/voice-pwa/install.sh | sudo bash
 set -e
 
 echo "=== Voice PWA installer ==="
 
-# Create temp dir
-TMP=$(mktemp -d)
-trap "rm -rf $TMP" EXIT
+# ── 1. Find voice-gateway container IP ───────────────────────────────────────
+echo "[1/3] Finding voice-gateway container..."
+VOICE_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
+  $(docker ps --format "{{.ID}} {{.Names}}" | grep -i voice | awk '{print $1}' | head -1) 2>/dev/null || echo "172.17.0.5")
 
-# Write voice-pwa-start.sh
-cat > "$TMP/voice-pwa-start.sh" << 'STARTSCRIPT'
-#!/bin/bash
-# voice-pwa-start.sh — run by launchd on boot.
-# Finds the voice-gateway Docker container IP dynamically,
-# then runs socat to forward host port 3001 → container:3000.
-# Loops every 30s to repoint socat if the container restarts and gets a new IP.
+echo "  Container IP: $VOICE_IP"
 
-LOG="/var/log/voice-pwa.log"
-PORT_HOST=3001
-PORT_CONTAINER=3000
+# ── 2. Start proxy container ──────────────────────────────────────────────────
+echo "[2/3] Starting voice-proxy container (port 3002 → $VOICE_IP:3000)..."
+docker rm -f voice-proxy 2>/dev/null || true
+docker run -d \
+  --name voice-proxy \
+  -p 3002:3000 \
+  --restart unless-stopped \
+  alpine sh -c "apk add -q socat && socat TCP-LISTEN:3000,fork,reuseaddr TCP:${VOICE_IP}:3000"
 
-log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG"; }
-
-find_ip() {
-  # Search Docker containers whose name contains "voice" (NanoClaw naming convention)
-  local cid ip
-  cid=$(docker ps --format "{{.ID}} {{.Names}}" 2>/dev/null \
-        | grep -i "voice" | awk '{print $1}' | head -1)
-  if [ -n "$cid" ]; then
-    ip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$cid" 2>/dev/null)
-    [ -n "$ip" ] && echo "$ip" && return
+sleep 2
+echo "  Waiting for proxy..."
+for i in 1 2 3 4 5; do
+  if curl -sf http://localhost:3002/ > /dev/null 2>&1; then
+    echo "  ✓ Proxy up (HTTP 200)"
+    break
   fi
-  # Fallback: last known static IP
-  echo "172.17.0.5"
-}
-
-kill_socat() { pkill -f "socat TCP-LISTEN:${PORT_HOST}" 2>/dev/null || true; sleep 0.5; }
-
-CURRENT_IP=""
-SOCAT_PID=""
-
-log "voice-pwa-start: starting"
-
-while true; do
-  NEW_IP=$(find_ip)
-
-  if [ "$NEW_IP" != "$CURRENT_IP" ] || ! kill -0 "$SOCAT_PID" 2>/dev/null; then
-    log "Container IP: ${NEW_IP} (was: ${CURRENT_IP:-none}). Restarting socat."
-    kill_socat
-    CURRENT_IP="$NEW_IP"
-    socat TCP-LISTEN:${PORT_HOST},fork,reuseaddr "TCP:${CURRENT_IP}:${PORT_CONTAINER}" &
-    SOCAT_PID=$!
-    log "socat PID=$SOCAT_PID → ${CURRENT_IP}:${PORT_CONTAINER}"
-  fi
-
-  sleep 30
+  sleep 2
 done
 
-STARTSCRIPT
-
-# Write plist
-cat > "$TMP/com.nanoclaw.voice-pwa.plist" << 'PLISTEOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>com.nanoclaw.voice-pwa</string>
-
-  <key>ProgramArguments</key>
-  <array>
-    <string>/bin/bash</string>
-    <string>/usr/local/bin/voice-pwa-start.sh</string>
-  </array>
-
-  <!-- Start immediately when loaded, and on every boot -->
-  <key>RunAtLoad</key>
-  <true/>
-
-  <!-- Restart automatically if the script exits for any reason -->
-  <key>KeepAlive</key>
-  <true/>
-
-  <key>StandardOutPath</key>
-  <string>/var/log/voice-pwa.log</string>
-  <key>StandardErrorPath</key>
-  <string>/var/log/voice-pwa.log</string>
-
-  <!-- Give Docker time to come up before this runs on boot -->
-  <key>StartInterval</key>
-  <integer>0</integer>
-  <key>ThrottleInterval</key>
-  <integer>10</integer>
-</dict>
-</plist>
-
-PLISTEOF
-
-# Install
-if ! command -v socat >/dev/null 2>&1; then
-  echo "[1/4] Installing socat..."
-  brew install socat
-else
-  echo "[1/4] socat OK"
-fi
-
-echo "[2/4] Installing start script..."
-cp "$TMP/voice-pwa-start.sh" /usr/local/bin/voice-pwa-start.sh
-chmod +x /usr/local/bin/voice-pwa-start.sh
-
-echo "[3/4] Installing launchd daemon..."
-cp "$TMP/com.nanoclaw.voice-pwa.plist" /Library/LaunchDaemons/com.nanoclaw.voice-pwa.plist
-launchctl unload /Library/LaunchDaemons/com.nanoclaw.voice-pwa.plist 2>/dev/null || true
-launchctl load /Library/LaunchDaemons/com.nanoclaw.voice-pwa.plist
-echo "  Logs: tail -f /var/log/voice-pwa.log"
-
-echo "[4/4] Tailscale serve..."
-if tailscale serve status 2>/dev/null | grep -q "3001"; then
-  echo "  already configured"
-else
-  tailscale serve --bg 3001 2>/dev/null || echo "  Run manually: tailscale serve --bg 3001"
-fi
+# ── 3. Configure Tailscale ────────────────────────────────────────────────────
+echo "[3/3] Configuring Tailscale HTTPS → port 3002..."
+# Remove old conflicting serve entries
+tailscale serve --https=443 off 2>/dev/null || true
+sleep 1
+tailscale serve --bg 3002 2>/dev/null \
+  || tailscale serve https / http://localhost:3002 \
+  || echo "  ⚠ Run manually: tailscale serve --bg 3002"
 
 echo ""
-echo "Done! URL: https://danelminis-mac-mini-1.tail6119bd.ts.net/"
-echo "Check: curl -I http://localhost:3001/"
+echo "=== Done ==="
+echo "URL: https://danelminis-mac-mini-1.tail6119bd.ts.net/"
+echo ""
+echo "Verify: curl -I http://localhost:3002/"
+echo "Logs:   docker logs voice-proxy"
