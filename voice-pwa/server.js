@@ -35,6 +35,23 @@ async function transcribeGroq(audioBuffer, mimeType) {
   return (await res.json()).text?.trim() || '';
 }
 
+async function synthesizeGoogle(text) {
+  const res = await fetch('https://texttospeech.googleapis.com/v1/text:synthesize', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-goog-api-key': 'onecli-managed',
+    },
+    body: JSON.stringify({
+      input: { text },
+      voice: { languageCode: 'he-IL', name: 'he-IL-Chirp3-HD-Aoede' },
+      audioConfig: { audioEncoding: 'MP3' },
+    }),
+  });
+  if (!res.ok) throw new Error(`Google TTS ${res.status}: ${await res.text()}`);
+  return (await res.json()).audioContent; // base64 MP3
+}
+
 async function askGroq(sessionId, userText) {
   const history = getHistory(sessionId);
   history.push({ role: 'user', content: userText });
@@ -100,7 +117,8 @@ const srv = Bun.serve({
         const replyText = await askGroq(sessionId, text);
         console.log(`[LLM][${sessionId.slice(0,8)}] "${replyText}"`);
 
-        return Response.json({ text, replyText, sessionId });
+        const audioContent = await synthesizeGoogle(replyText);
+        return Response.json({ text, replyText, sessionId, audioContent });
       } catch (e) {
         console.error('[/voice error]', e.message);
         return Response.json({ error: e.message }, { status: 500 });
