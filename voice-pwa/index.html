@@ -97,6 +97,25 @@
 
     let mediaRecorder, audioChunks = [], isRecording = false, isProcessing = false;
     let sessionId = localStorage.getItem('voiceSessionId') || null;
+    let audioCtx = null;
+
+    function getAudioCtx() {
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      return audioCtx;
+    }
+
+    async function playAudio(base64mp3) {
+      const ctx = getAudioCtx();
+      await ctx.resume();
+      const bytes = atob(base64mp3);
+      const arr = new Uint8Array(bytes.length);
+      for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+      const decoded = await ctx.decodeAudioData(arr.buffer.slice(0));
+      const source = ctx.createBufferSource();
+      source.buffer = decoded;
+      source.connect(ctx.destination);
+      source.start(0);
+    }
 
     function setStatus(text, dot) { statusLabel.textContent = text; statusDot.className = dot || ''; }
     function addBubble(text, type) {
@@ -124,7 +143,7 @@
         mediaRecorder.start();
         isRecording = true;
         setMic('listening'); setStatus('מקשיב…', 'listening');
-        if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+        getAudioCtx().resume().catch(() => {});
       } catch { setStatus('אין גישה למיקרופון', 'error'); }
     }
 
@@ -151,15 +170,7 @@
         }
         addBubble(data.text, 'user');
         addBubble(data.replyText, 'nano');
-        if (data.audioContent) {
-          const bytes = atob(data.audioContent);
-          const arr = new Uint8Array(bytes.length);
-          for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
-          const url = URL.createObjectURL(new Blob([arr], { type: 'audio/mpeg' }));
-          const audio = new Audio(url);
-          audio.play().catch(() => {});
-          audio.onended = () => URL.revokeObjectURL(url);
-        }
+        if (data.audioContent) await playAudio(data.audioContent);
         setStatus('מוכן', 'ready');
       } catch (e) {
         addBubble(e.message, 'err'); setStatus('שגיאה — נסה שוב', 'error');
