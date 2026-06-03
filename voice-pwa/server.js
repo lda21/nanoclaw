@@ -5,7 +5,7 @@
  * GET  /      — serves PWA HTML
  */
 
-import { readFileSync, unlinkSync } from 'fs';
+import { readFileSync } from 'fs';
 import { randomUUID } from 'crypto';
 
 const PORT = parseInt(process.env.PORT || '3000');
@@ -36,13 +36,10 @@ async function transcribeGroq(audioBuffer, mimeType) {
 }
 
 async function synthesizeEdgeTTS(text) {
-  const tmpFile = `/tmp/tts_${randomUUID()}.mp3`;
-  const proc = Bun.spawn(['python3', '-m', 'edge_tts', '--voice', 'he-IL-HilaNeural', '--text', text, '--write-media', tmpFile]);
-  const exitCode = await proc.exited;
-  if (exitCode !== 0) throw new Error(`edge-tts exited with code ${exitCode}`);
-  const mp3 = readFileSync(tmpFile);
-  try { unlinkSync(tmpFile); } catch {}
-  return mp3.toString('base64');
+  const res = await fetch(`http://localhost:5000/tts?text=${encodeURIComponent(text)}`);
+  if (!res.ok) throw new Error(`TTS server ${res.status}: ${await res.text()}`);
+  const buf = Buffer.from(await res.arrayBuffer());
+  return buf.toString('base64');
 }
 
 async function askGroq(sessionId, userText) {
