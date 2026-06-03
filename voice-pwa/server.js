@@ -5,7 +5,7 @@
  * GET  /      — serves PWA HTML
  */
 
-import { readFileSync } from 'fs';
+import { readFileSync, unlinkSync } from 'fs';
 import { randomUUID } from 'crypto';
 
 const PORT = parseInt(process.env.PORT || '3000');
@@ -35,21 +35,14 @@ async function transcribeGroq(audioBuffer, mimeType) {
   return (await res.json()).text?.trim() || '';
 }
 
-async function synthesizeGoogle(text) {
-  const res = await fetch('https://texttospeech.googleapis.com/v1/text:synthesize', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-goog-api-key': 'onecli-managed',
-    },
-    body: JSON.stringify({
-      input: { text },
-      voice: { languageCode: 'he-IL', name: 'he-IL-Chirp3-HD-Aoede' },
-      audioConfig: { audioEncoding: 'MP3' },
-    }),
-  });
-  if (!res.ok) throw new Error(`Google TTS ${res.status}: ${await res.text()}`);
-  return (await res.json()).audioContent; // base64 MP3
+async function synthesizeEdgeTTS(text) {
+  const tmpFile = `/tmp/tts_${randomUUID()}.mp3`;
+  const proc = Bun.spawn(['python3', '-m', 'edge_tts', '--voice', 'he-IL-HilaNeural', '--text', text, '--write-media', tmpFile]);
+  const exitCode = await proc.exited;
+  if (exitCode !== 0) throw new Error(`edge-tts exited with code ${exitCode}`);
+  const mp3 = readFileSync(tmpFile);
+  try { unlinkSync(tmpFile); } catch {}
+  return mp3.toString('base64');
 }
 
 async function askGroq(sessionId, userText) {
@@ -117,7 +110,7 @@ const srv = Bun.serve({
         const replyText = await askGroq(sessionId, text);
         console.log(`[LLM][${sessionId.slice(0,8)}] "${replyText}"`);
 
-        const audioContent = await synthesizeGoogle(replyText);
+        const audioContent = await synthesizeEdgeTTS(replyText);
         return Response.json({ text, replyText, sessionId, audioContent });
       } catch (e) {
         console.error('[/voice error]', e.message);
