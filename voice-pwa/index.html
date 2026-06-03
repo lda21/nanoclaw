@@ -151,10 +151,15 @@
         }
         addBubble(data.text, 'user');
         addBubble(data.replyText, 'nano');
-        speechSynthesis.cancel();
-        const utt = new SpeechSynthesisUtterance(data.replyText);
-        utt.lang = 'he-IL'; utt.rate = 1.0; utt.pitch = 1.0;
-        speechSynthesis.speak(utt);
+        if (data.audioContent) {
+          const bytes = atob(data.audioContent);
+          const arr = new Uint8Array(bytes.length);
+          for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+          const url = URL.createObjectURL(new Blob([arr], { type: 'audio/mpeg' }));
+          const audio = new Audio(url);
+          audio.play().catch(() => {});
+          audio.onended = () => URL.revokeObjectURL(url);
+        }
         setStatus('מוכן', 'ready');
       } catch (e) {
         addBubble(e.message, 'err'); setStatus('שגיאה — נסה שוב', 'error');
