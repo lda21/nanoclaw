@@ -17,14 +17,35 @@ import { getAgentGroup } from './db/agent-groups.js';
 import { GROUPS_DIR } from './config.js';
 
 const FILE_CAP = 64 * 1024;
+/** Media (image/audio) is served base64 up to this cap — voice notes and
+ *  screenshots, not videos. */
+const MEDIA_CAP = 4 * 1024 * 1024;
 /** Hidden from listings — tooling noise, not agent work product. */
 const HIDDEN = new Set(['node_modules', '.git', '.pnpm-store', '.DS_Store']);
+
+/** Extensions served as base64 media instead of text. */
+const MEDIA_MIME: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.ogg': 'audio/ogg',
+  '.opus': 'audio/ogg',
+  '.mp3': 'audio/mpeg',
+  '.m4a': 'audio/mp4',
+  '.wav': 'audio/wav',
+};
 
 export interface GroupFileResult {
   ok: boolean;
   kind?: 'dir' | 'file';
   entries?: Array<{ name: string; size: number; mtime: string; dir: boolean }>;
   content?: string | null;
+  /** 'base64' for media files; absent/utf-8 for text. */
+  encoding?: 'utf-8' | 'base64';
+  /** Set for media files (image/* or audio/*). */
+  mime?: string;
   truncated?: boolean;
   error?: string;
 }
@@ -78,6 +99,21 @@ export async function readGroupFile(groupId: string, relPath: string): Promise<G
       // Directories first, then by name.
       .sort((a, b) => Number(b.dir) - Number(a.dir) || a.name.localeCompare(b.name));
     return { ok: true, kind: 'dir', entries };
+  }
+
+  // Media (images / voice notes) → base64 with a mime so the app can render
+  // or play it inline.
+  const mime = MEDIA_MIME[path.extname(real).toLowerCase()];
+  if (mime) {
+    if (stat.size > MEDIA_CAP) return { ok: false, error: 'media file too large to view' };
+    return {
+      ok: true,
+      kind: 'file',
+      mime,
+      encoding: 'base64',
+      content: fs.readFileSync(real).toString('base64'),
+      truncated: false,
+    };
   }
 
   if (stat.size > 2 * 1024 * 1024) {
