@@ -62,7 +62,7 @@ import './cli/delivery-action.js';
 import { startCliServer, stopCliServer } from './cli/socket-server.js';
 
 import type { ChannelAdapter, ChannelSetup } from './channels/adapter.js';
-import { initChannelAdapters, teardownChannelAdapters, getChannelAdapter } from './channels/channel-registry.js';
+import { initChannelAdapters, teardownChannelAdapters, getChannelAdapter, syncChannelConversations } from './channels/channel-registry.js';
 
 async function main(): Promise<void> {
   log.info('NanoClaw starting');
@@ -184,8 +184,49 @@ async function main(): Promise<void> {
   const dashboardPort = parseInt(process.env.DASHBOARD_PORT || dashboardEnv.DASHBOARD_PORT || '3100', 10);
   if (dashboardSecret) {
     const { startDashboard } = await import('@nanoco/nanoclaw-dashboard');
-    const { startDashboardPusher } = await import('./dashboard-pusher.js');
-    startDashboard({ port: dashboardPort, secret: dashboardSecret });
+    const { startDashboardPusher, pushSnapshotNow } = await import('./dashboard-pusher.js');
+    // Bind loopback only — external access is via Tailscale Serve on the same
+    // port, which would otherwise collide with a 0.0.0.0 bind on the tailnet IP.
+    const { getPendingApproval } = await import('./db/sessions.js');
+    const { ONECLI_ACTION } = await import('./modules/approvals/onecli-approvals.js');
+    startDashboard({
+      port: dashboardPort,
+      host: '127.0.0.1',
+      secret: dashboardSecret,
+      // Web-resolve policy: cli_command + self-mod are allowed; OneCLI
+      // credential approvals stay chat-only (identified admin). Auth is the
+      // shared DASHBOARD_SECRET — there is no per-user identity here, so the
+      // approver is recorded synthetically. Mirror the `actionable` flag in
+      // dashboard-pusher.ts if this gate changes.
+      onApprovalDecision: async (id: string, decision: 'approve' | 'reject') => {
+        const approval = getPendingApproval(id);
+        if (!approval) return { ok: false, error: 'Approval not found (already resolved?)' };
+        if (approval.action === ONECLI_ACTION) {
+          return { ok: false, error: 'OneCLI credential approvals must be resolved from chat' };
+        }
+        await dispatchResponse({
+          questionId: id,
+          value: decision,
+          userId: 'dashboard:web',
+          channelType: 'dashboard',
+          platformId: '',
+          threadId: null,
+        });
+        return { ok: true };
+      },
+      // On-demand channel conversation sync (NanoDash app "Sync groups"):
+      // registers newly created platform groups that the startup scan never
+      // writes and the router only registers on DM/@-mention. On success,
+      // push a fresh snapshot immediately so the app sees the new groups
+      // without waiting for the 60s pusher tick.
+      onChannelSync: async (channelType: string) => {
+        const result = await syncChannelConversations(channelType);
+        if (result.ok && (result.registered ?? 0) + (result.updated ?? 0) > 0) {
+          pushSnapshotNow();
+        }
+        return result;
+      },
+    });
     startDashboardPusher({ port: dashboardPort, secret: dashboardSecret, intervalMs: 60000 });
   } else {
     log.info('Dashboard disabled (no DASHBOARD_SECRET)');

@@ -10,6 +10,7 @@ import Database from 'better-sqlite3';
 import { getAllAgentGroups, getAgentGroup } from './db/agent-groups.js';
 import { getSessionsByAgentGroup } from './db/sessions.js';
 import { getContainerConfig } from './db/container-configs.js';
+import { ONECLI_ACTION } from './modules/approvals/onecli-approvals.js';
 import { getAllMessagingGroups, getMessagingGroupAgents } from './db/messaging-groups.js';
 import { getDestinations } from './modules/agent-to-agent/db/agent-destinations.js';
 import { getMembers } from './modules/permissions/db/agent-group-members.js';
@@ -29,10 +30,17 @@ interface PusherConfig {
 
 let timer: ReturnType<typeof setInterval> | null = null;
 let logTimer: ReturnType<typeof setInterval> | null = null;
+let approvalsTimer: ReturnType<typeof setInterval> | null = null;
 let logOffset = 0;
+
+// Approvals refresh on a tight loop, independent of the heavy 60s full
+// snapshot — it's a single cheap query, so the dashboard can show new/resolved
+// approvals within a few seconds.
+const APPROVALS_INTERVAL_MS = 5000;
 
 export function startDashboardPusher(config: PusherConfig): void {
   const interval = config.intervalMs || 60000;
+  lastConfig = config;
 
   // Push immediately on start, then on interval
   push(config).catch((err) => log.error('Dashboard push failed', { err }));
@@ -40,20 +48,49 @@ export function startDashboardPusher(config: PusherConfig): void {
     push(config).catch((err) => log.error('Dashboard push failed', { err }));
   }, interval);
 
+  // Fast approvals-only refresh (merges into the snapshot host-side).
+  approvalsTimer = setInterval(() => pushApprovals(config), APPROVALS_INTERVAL_MS);
+
   // Start log file tailing
   startLogTail(config);
 
-  log.info('Dashboard pusher started', { intervalMs: interval });
+  log.info('Dashboard pusher started', { intervalMs: interval, approvalsMs: APPROVALS_INTERVAL_MS });
 }
+
+/**
+ * Push a full snapshot immediately (out-of-band of the 60s interval). Used
+ * after state-mutating admin actions (e.g. channel sync) so the dashboard and
+ * the NanoDash app see the change right away. No-op when the pusher hasn't
+ * been started (no config yet).
+ */
+export function pushSnapshotNow(): void {
+  if (!lastConfig) return;
+  push(lastConfig).catch((err) => log.error('Dashboard push failed', { err }));
+}
+
+let lastConfig: PusherConfig | null = null;
 
 export function stopDashboardPusher(): void {
   if (timer) {
     clearInterval(timer);
     timer = null;
   }
+  if (approvalsTimer) {
+    clearInterval(approvalsTimer);
+    approvalsTimer = null;
+  }
   if (logTimer) {
     clearInterval(logTimer);
     logTimer = null;
+  }
+}
+
+/** Cheap approvals-only fast-path push (decoupled from the full snapshot). */
+function pushApprovals(config: PusherConfig): void {
+  try {
+    postJson(config, '/api/approvals/push', { approvals: collectApprovals() });
+  } catch (err) {
+    log.error('Dashboard approvals push failed', { err });
   }
 }
 
@@ -139,7 +176,63 @@ function collectSnapshot(): Record<string, unknown> {
     context_windows: collectContextWindows(),
     activity: collectActivity(),
     messages: collectMessages(),
+    approvals: collectApprovals(),
   };
+}
+
+/** Pending (and recently-resolved) host-side approvals from the central DB. */
+function collectApprovals() {
+  try {
+    const db = getDb();
+    const rows = db
+      .prepare(
+        `SELECT approval_id, action, title, status, session_id, agent_group_id, created_at, expires_at, payload
+         FROM pending_approvals ORDER BY created_at DESC`,
+      )
+      .all() as Array<Record<string, unknown>>;
+    const nameMap = new Map(getAllAgentGroups().map((g) => [g.id, g.name]));
+    return rows.map((r) => {
+      const agentGroupId = (r.agent_group_id as string) || null;
+      return {
+        approval_id: r.approval_id as string,
+        action: (r.action as string) ?? '',
+        title: (r.title as string) || '',
+        status: (r.status as string) ?? '',
+        detail: summarizeApprovalPayload(r.payload as string | null),
+        // Dashboard may resolve everything except OneCLI credential approvals,
+        // which stay chat-only (identified admin). Mirrors the host-side gate
+        // in src/index.ts onApprovalDecision.
+        actionable: r.status === 'pending' && r.action !== ONECLI_ACTION,
+        session_id: (r.session_id as string) || null,
+        agent_group_id: agentGroupId,
+        agent_group_name: agentGroupId ? (nameMap.get(agentGroupId) ?? null) : null,
+        created_at: r.created_at as string,
+        expires_at: (r.expires_at as string) || null,
+      };
+    });
+  } catch {
+    return [];
+  }
+}
+
+/** Collapse an approval payload into a one-line human summary. */
+function summarizeApprovalPayload(payload: string | null): string {
+  if (!payload) return '';
+  try {
+    const p = JSON.parse(payload) as Record<string, unknown>;
+    const frame = p.frame as { command?: string; args?: unknown } | undefined;
+    if (frame) {
+      const cmd = frame.command ?? '';
+      const args = frame.args && Object.keys(frame.args).length ? JSON.stringify(frame.args) : '';
+      return [cmd, args].filter(Boolean).join(' ');
+    }
+    if (p.packages) {
+      return 'packages: ' + (Array.isArray(p.packages) ? p.packages.join(', ') : String(p.packages));
+    }
+    return JSON.stringify(p);
+  } catch {
+    return String(payload).slice(0, 200);
+  }
 }
 
 function collectAgentGroups() {
