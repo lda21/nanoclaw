@@ -18,7 +18,7 @@ import { getAllUsers, getUser } from './modules/permissions/db/users.js';
 import { getUserRoles, getAdminsOfAgentGroup } from './modules/permissions/db/user-roles.js';
 import { getUserDmsForUser } from './modules/permissions/db/user-dms.js';
 import { getActiveAdapters, getRegisteredChannelNames } from './channels/channel-registry.js';
-import { DATA_DIR, ASSISTANT_NAME } from './config.js';
+import { DATA_DIR, GROUPS_DIR, ASSISTANT_NAME } from './config.js';
 import { getDb } from './db/connection.js';
 import { log } from './log.js';
 
@@ -235,6 +235,53 @@ function summarizeApprovalPayload(payload: string | null): string {
   }
 }
 
+/** Cap per personality file so a runaway CLAUDE.md can't bloat the snapshot. */
+const BRAIN_FILE_CAP = 32 * 1024;
+
+/**
+ * The agent "brain" — the filesystem side of an agent group's identity, read
+ * from groups/<folder>/: the composed CLAUDE.md, the self-customized
+ * CLAUDE.local.md, and the .claude-fragments/ file names (skill-*.md are the
+ * wired skills, module-*.md the instruction modules). Tools (MCP servers,
+ * packages) already travel via container_config. Best-effort: any read error
+ * degrades to null/[] — the snapshot must never fail on a missing folder.
+ */
+function collectBrain(folder: string): {
+  claude_md: string | null;
+  claude_local_md: string | null;
+  fragments: string[];
+} | null {
+  const dir = path.join(GROUPS_DIR, folder);
+  const readCapped = (file: string): string | null => {
+    try {
+      const text = fs.readFileSync(path.join(dir, file), 'utf-8');
+      if (!text.trim()) return null;
+      return text.length > BRAIN_FILE_CAP ? `${text.slice(0, BRAIN_FILE_CAP)}\n… (truncated)` : text;
+    } catch {
+      return null;
+    }
+  };
+  try {
+    if (!fs.existsSync(dir)) return null;
+    let fragments: string[] = [];
+    try {
+      fragments = fs
+        .readdirSync(path.join(dir, '.claude-fragments'))
+        .filter((f) => f.endsWith('.md'))
+        .sort();
+    } catch {
+      /* no fragments dir */
+    }
+    return {
+      claude_md: readCapped('CLAUDE.md'),
+      claude_local_md: readCapped('CLAUDE.local.md'),
+      fragments,
+    };
+  } catch {
+    return null;
+  }
+}
+
 function collectAgentGroups() {
   return getAllAgentGroups().map((g) => {
     const sessions = getSessionsByAgentGroup(g.id);
@@ -266,6 +313,7 @@ function collectAgentGroups() {
       folder: g.folder,
       agent_provider: g.agent_provider,
       container_config: getContainerConfig(g.id) ?? null,
+      brain: collectBrain(g.folder),
       sessionCount: sessions.length,
       runningSessions: running.length,
       wirings,
