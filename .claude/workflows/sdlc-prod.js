@@ -1,0 +1,502 @@
+export const meta = {
+  name: 'sdlc-prod',
+  description: 'Hardened SDLC build workflow: additive-aware planning, parallel build with retry, a deterministic git-numstat GROUND-TRUTH gate (the SCRIPT parses the diff — a build that wrote no real files is re-run, never shipped, and forces deployReady=false), per-stage commits, adversarial verify, render-asserting QA — and it drives the built system to embody 14 architecture principles.',
+  whenToUse: 'Any substantial build/extend on a repo where you want production-grade orchestration AND a product that is observable, durable, resilient, idempotent, secure, auditable, testable. Detects greenfield vs existing repo (schema boolean) and plans the delta either way; never clobbers an existing tree. Pass {repo, brief} (NOT a prose string).',
+  phases: [
+    { title: 'Intake' },
+    { title: 'PRD' },
+    { title: 'Architecture' },
+    { title: 'Plan' },
+    { title: 'Build' },
+    { title: 'Verify' },
+    { title: 'QA' },
+    { title: 'Acceptance' },
+    { title: 'Manifest' },
+  ],
+}
+
+/*
+ * ── How this workflow covers the 14 architecture principles ──────────────────
+ * [HARNESS] = how the WORKFLOW RUN itself honors it; [BUILT] = how it forces the
+ * PRODUCT to honor it (injected into prompts + checked in Verify/QA/Acceptance).
+ *
+ * Observability  [HARNESS] log() per step + run journal + committed run manifest
+ *                [BUILT]   structured logs, request IDs, metrics, error tracking
+ * Scalability    [HARNESS] parallel() fan-out to the concurrency cap
+ *                [BUILT]   stateless services + async/queue patterns
+ * Durability     [HARNESS] git commit+push after EVERY stage + resume journal
+ *                [BUILT]   persist state to a durable store after each step
+ * Resilience     [HARNESS] per-step retry (empty/error = fail), bounded converge loops
+ *                [BUILT]   retries/timeouts/circuit-breakers/DLQ in the product
+ * Recoverability [HARNESS] resume via {scriptPath, resumeFromRunId} + git state
+ *                [BUILT]   product resumes from last good checkpoint
+ * Idempotency    [HARNESS] every stage re-runnable against GROUND TRUTH (audit-before-do; additive plans the delta)
+ *                [BUILT]   each product step idempotent (idempotency keys/upserts)
+ * Correctness    [HARNESS] git-numstat GROUND-TRUTH gate: the SCRIPT (not an agent) parses the diff; a task that
+ *                          claims "done" but left no real file (>= MIN_ADDED lines at its declared path) is a GHOST
+ *                          and is re-implemented; a still-hollow build after N rounds forces deployReady=false
+ *                [BUILT]   (guards the harness against shipping a hollow/destructive build)
+ * Security       [HARNESS] secrets never in args/logs/prompts; least privilege
+ *                [BUILT]   per-action authz, secret protection, encryption, service isolation
+ * Auditability   [HARNESS] git author+message trail + run manifest + approval gate
+ *                [BUILT]   product audit log (actor, change, reason, prev/new state, approvals)
+ * Consistency    [HARNESS] one logical change per stage; colliding tasks serialized, shared edits deferred to integrate
+ *                [BUILT]   transactions per step; Saga/compensation across steps
+ * Maintainability[HARNESS] small phases with schema'd input/output contracts
+ *                [BUILT]   small, independent, versioned modules with clear contracts
+ * Testability    [HARNESS] verify gate + tiered QA incl. FAILURE scenarios + render-assert
+ *                [BUILT]   unit+integration+e2e, render-assert success surface, FAIL on console/page errors
+ * Performance    [HARNESS] parallel where safe; cached design via resume; no busy-polling
+ *                [BUILT]   async, caching, no blocking long-running steps
+ * Extensibility  [HARNESS] config-driven — args control tasks/stopAfter/fanout
+ *                [BUILT]   add/remove/reorder steps via config / workflow definition
+ * Cost Efficiency[HARNESS] concurrency cap, ground-truth = no re-doing done work, budget-aware
+ *                [BUILT]   scale workers to demand; avoid polling/duplicated jobs
+ * ────────────────────────────────────────────────────────────────────────────
+ */
+
+// ---- args (STRUCTURED — never a prose string; that leaves repo null) --------
+let A = args
+if (typeof A === 'string') {
+  const t = A.trim()
+  try {
+    A = t.startsWith('{') ? JSON.parse(t) : { brief: A }
+  } catch (e) {
+    A = { brief: A }
+  }
+}
+if (!A || typeof A !== 'object' || Array.isArray(A)) A = {}
+const cfg = A
+const REPO = cfg.repo || cfg.path || null
+const BRIEF = cfg.brief || cfg.discovery || ''
+const J = (x) => JSON.stringify(x)
+const MAX_RETRY = cfg.maxRetry ?? 4
+const MAX_ROUNDS = cfg.maxRounds ?? 3
+const MAX_GT = cfg.maxGroundTruth ?? 3
+const MIN_ADDED = cfg.minAdded ?? 12 // a "landed" file must add at least this many lines (defeats empty stubs / route shims)
+const STOP_AFTER = cfg.stopAfter || 'manifest'
+const ORDER = ['intake', 'prd', 'architecture', 'plan', 'build', 'verify', 'qa', 'acceptance', 'manifest']
+const willRun = (s) => ORDER.indexOf(s) <= ORDER.indexOf(ORDER.includes(STOP_AFTER) ? STOP_AFTER : 'manifest')
+
+if (!REPO) return { error: 'sdlc-prod requires args.repo (a real repo path). Pass {repo, brief} as a STRUCTURED object, not a string.' }
+if (!BRIEF || BRIEF.trim().length < 20) return { error: 'sdlc-prod requires args.brief (the settled discovery brief).' }
+
+const PRINCIPLES = `NON-NEGOTIABLE ARCHITECTURE PRINCIPLES the built system MUST embody (and you must call out HOW each is met):
+Observability (structured logs + request IDs + metrics + error tracking), Scalability (stateless + async),
+Durability (persist state after each step), Resilience (retries/timeouts/circuit-breakers/DLQ),
+Recoverability (resume from last good state), Idempotency (every step safe to retry, no dupes),
+Security (per-action authz, protect/encrypt secrets, isolate services), Auditability (actor/change/reason/prev→new/approvals),
+Consistency (txn per step; Saga/compensation across steps), Maintainability (small versioned modules, clear contracts),
+Testability (unit+integration+e2e + failure scenarios), Performance (async/caching/no blocking),
+Extensibility (config-driven steps), Cost-efficiency (scale to demand, no polling/dup work).`
+
+// ── module state set during the run ───────────────────────────────────────────
+let REPO_AUDIT = ''
+let ADDITIVE = false
+let GROUND_TRUTH = { clean: true, ghosts: [] } // build correctness verdict; honored by Verify/Acceptance/Manifest
+
+// ── generic helpers ──────────────────────────────────────────────────────────
+
+// Durability + Auditability: commit+push whatever is in the tree.
+async function commitStage(tag, note) {
+  try {
+    await agent(
+      `In the git repo at ${REPO}, persist progress so nothing is lost. Run: git add -A; git -c commit.gpgsign=false commit -m "wf(${tag}): ${note}" --no-verify; git push origin HEAD. If "nothing to commit", just confirm. Do NOT modify source — ONLY stage/commit/push. Report the commit hash or "nothing to commit".`,
+      { label: `commit:${tag}`, phase: 'Build' }
+    )
+  } catch (e) {
+    log(`commit:${tag} failed (non-fatal): ${String((e && e.message) || e)}`)
+  }
+}
+
+// Resilience: one attempt that REPORTS FAILURE on throw OR empty/short output.
+async function attempt(label, phase, prompt) {
+  let out = null
+  try {
+    out = await agent(prompt, { label, phase })
+  } catch (e) {
+    return { ok: false, reason: `error: ${String((e && e.message) || e).slice(0, 140)}` }
+  }
+  const text = typeof out === 'string' ? out : out == null ? '' : JSON.stringify(out)
+  if (!text || text.trim().length < 60) return { ok: false, reason: 'empty/zero-token output' }
+  return { ok: true, text: text.trim() }
+}
+
+async function withRetry(label, phase, prompt, max) {
+  let last = null
+  for (let i = 1; i <= max; i++) {
+    last = await attempt(i === 1 ? label : `${label}:r${i}`, phase, prompt)
+    if (last.ok) return { ...last, attempts: i }
+    log(`${label} attempt ${i}/${max} failed (${last.reason}) — ${i < max ? 'retrying' : 'giving up'}`)
+  }
+  return { ok: false, attempts: max, reason: last ? last.reason : 'unknown' }
+}
+
+const CRITIQUE = {
+  type: 'object',
+  additionalProperties: false,
+  properties: { passed: { type: 'boolean' }, gaps: { type: 'array', items: { type: 'string' } } },
+  required: ['passed', 'gaps'],
+}
+
+// Generic critique→remediate convergence loop (Resilience/Testability).
+async function converge(label, phase, makeBuild, makeReview, rounds) {
+  let prev = null
+  for (let r = 1; r <= rounds; r++) {
+    const built = await withRetry(`${label}:build:r${r}`, phase, makeBuild(r, prev))
+    if (!built.ok) {
+      prev = { artifact: prev ? prev.artifact : '', verdict: { passed: false, gaps: [built.reason] } }
+      continue
+    }
+    const verdict = await agent(makeReview(built.text, r), { label: `${label}:review:r${r}`, phase, schema: CRITIQUE })
+    prev = { artifact: built.text, verdict }
+    if (verdict.passed) return { artifact: built.text, passed: true, rounds: r }
+    log(`${label} review r${r}: ${verdict.gaps.length} gap(s)`)
+  }
+  return { artifact: prev ? prev.artifact : '', passed: false, rounds }
+}
+
+// ── GROUND TRUTH (deterministic — the SCRIPT is the judge, not an agent) ──────
+// The agent is a DUMB TERMINAL: it runs git and pastes RAW output. The script
+// parses `git diff --numstat <base> HEAD` itself, so an agent cannot "echo the
+// plan" into a fake done-list — the line counts and paths come from git.
+// RESIDUAL LIMITS (defense-in-depth, not absolutes): (1) the Workflow sandbox
+// can't exec git, so the raw text is still agent-pasted — a determined fabricator
+// could forge it; mitigated by head==baseRef detection + the independent
+// render-assert QA/Acceptance gates. (2) This gate proves ">= MIN_ADDED real
+// lines of non-stub code at the declared path" — it catches ZERO-file and
+// wrong-path builds outright, but a substantive-looking stub that compiles is
+// the render-asserting e2e's job to catch, not the script's.
+const RAW_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: {
+    head: { type: 'string' },        // `git rev-parse HEAD`
+    numstat: { type: 'string' },     // raw `git diff --numstat --no-renames <base> HEAD`
+    porcelain: { type: 'string' },   // raw `git status --porcelain` (uncommitted leftovers)
+    stubgrep: { type: 'string' },    // raw `git grep -nE <stub markers>` over the changed files
+    ignored: { type: 'string' },     // raw `git check-ignore` over the declared task paths
+  },
+  required: ['head', 'numstat', 'porcelain'],
+}
+async function gitRef(label) {
+  const r = await agent(`In ${REPO}: run \`git rev-parse HEAD\` and return ONLY the 40-char hash as your entire output (no prose).`, { label, phase: 'Build' })
+  return String(typeof r === 'string' ? r : '').trim().split(/\s+/)[0] || ''
+}
+const STUB_MARKERS = 'TODO|FIXME|coming soon|not implemented|unimplemented|placeholder|stub'
+async function gitEvidence(baseRef, declaredPaths, label) {
+  const dp = (declaredPaths || []).slice(0, 200).map((p) => `'${String(p).replace(/'/g, '')}'`).join(' ')
+  const out = await agent(
+    `In ${REPO}, gather GROUND-TRUTH git evidence — do NOT modify anything, do NOT summarize. Run and paste RAW verbatim output for each:\n1) \`git rev-parse HEAD\` -> head\n2) \`git diff --numstat --no-renames ${baseRef} HEAD\` -> numstat (one line per file: "<added>\\t<deleted>\\t<path>")\n3) \`git status --porcelain\` -> porcelain\n4) take the file paths from the numstat output and run \`git grep -nIE "${STUB_MARKERS}" -- <those paths>\` -> stubgrep (raw; empty if none match)\n5) \`git check-ignore ${dp || '/dev/null'}\` -> ignored (raw list of any of those paths git would ignore; empty if none)\nPaste exact command output; no commentary.`,
+    { label, phase: 'Build', schema: RAW_SCHEMA })
+  return out && typeof out === 'object' ? out : { head: '', numstat: '', porcelain: '', stubgrep: '', ignored: '' }
+}
+const IGNORE_PATH = /(^|\/)(node_modules|dist|build|coverage|\.expo|\.next|\.turbo)\//
+const LOCK_PATH = /(package-lock\.json|pnpm-lock\.yaml|bun\.lock(b)?|yarn\.lock)$/
+// Defensive: if a rename form ("{old => new}" / "old => new") slips past
+// --no-renames, keep the NEW path only.
+function newPath(p) {
+  let s = String(p).trim()
+  const brace = s.match(/^(.*)\{.* => (.*)\}(.*)$/)
+  if (brace) s = (brace[1] + brace[2] + brace[3]).replace(/\/{2,}/g, '/')
+  else if (s.includes(' => ')) s = s.split(' => ').pop().trim()
+  return s
+}
+// Parse numstat into real source-file changes with added-line counts.
+function parseReal(numstat) {
+  const files = []
+  for (const line of String(numstat || '').split('\n')) {
+    const m = line.match(/^(\d+|-)\t(\d+|-)\t(.+)$/)
+    if (!m) continue
+    const path = newPath(m[3])
+    if (!path || IGNORE_PATH.test(path) || LOCK_PATH.test(path)) continue
+    files.push({ path, added: m[1] === '-' ? 0 : parseInt(m[1], 10) })
+  }
+  return files
+}
+function norm(p) { return String(p).replace(/^\.?\/*/, '').toLowerCase() }
+function toStubSet(stubgrep) {
+  return new Set(String(stubgrep || '').split('\n').map((l) => norm(l.split(':')[0].trim())).filter(Boolean))
+}
+function toIgnoredSet(ignored) {
+  return new Set(String(ignored || '').split('\n').map((l) => norm(l.trim().split('\t').pop())).filter(Boolean))
+}
+// Suffix match only — the changed path equals the declared path or ENDS WITH it
+// (declared is a suffix of changed). The reverse direction is dropped: a declared
+// path being a suffix of a shorter changed path is never evidence. Requires
+// >= MIN_ADDED added lines AND the file not flagged a stub by the marker scan.
+function fileLanded(declared, files, stubSet) {
+  const nf = norm(declared)
+  return files.some((ch) => {
+    if (ch.added < MIN_ADDED) return false
+    const nc = norm(ch.path)
+    if (stubSet && stubSet.has(nc)) return false
+    return nc === nf || nc.endsWith('/' + nf)
+  })
+}
+function taskLanded(task, files, stubSet) {
+  if (!task || !task.files || !task.files.length) return false // unprovable ⇒ ghost (fail closed)
+  return task.files.some((f) => fileLanded(f, files, stubSet))
+}
+
+// ── STAGE 1: Intake ──────────────────────────────────────────────────────────
+phase('Intake')
+const NORTH_STAR = `BRIEF:\n${BRIEF}\n\n${PRINCIPLES}\nImplementation target repo: ${REPO}.`
+const intake = await withRetry('intake', 'Intake',
+  `Read the repo at ${REPO} (its stack/conventions) and distill the brief into a crisp spec: problem, goals, constraints, and a numbered list of testable ACCEPTANCE CRITERIA. Fold the architecture principles in as explicit non-functional requirements with a concrete check for each.\n${NORTH_STAR}`, MAX_RETRY)
+await commitStage('intake', 'spec + acceptance criteria + principle NFRs')
+
+// ── STAGE 2: PRD ──────────────────────────────────────────────────────────────
+let prd = { artifact: '' }
+if (willRun('prd')) {
+  phase('PRD')
+  prd = await converge('prd', 'PRD',
+    (r, p) => r === 1
+      ? `Write the PRD for this product: screens/endpoints, user flows, data model, and how EACH architecture principle is satisfied. Stay within the goals (no scope creep).\nSPEC:\n${intake.text}\n${PRINCIPLES}`
+      : `Revise this PRD to resolve the gaps without dropping coverage.\nPRD:\n${p.artifact}\nGAPS:\n${J(p.verdict.gaps)}`,
+    (draft) => `Critically review this PRD. Pass ONLY if every acceptance criterion is covered, every architecture principle has a concrete plan, and there is no scope creep.\nSPEC:\n${intake.text}\nPRD:\n${draft}`,
+    MAX_ROUNDS)
+  await commitStage('prd', 'product requirements + principle coverage')
+}
+
+// ── STAGE 3: Architecture ────────────────────────────────────────────────────
+let arch = { artifact: '' }
+if (willRun('architecture')) {
+  phase('Architecture')
+  arch = await converge('arch', 'Architecture',
+    (r, p) => r === 1
+      ? `Design the architecture for the repo at ${REPO} (consistent with its stack). Address EVERY principle explicitly: observability, scalability, durability, resilience, recoverability, idempotency, security, auditability, consistency (txn-per-step + Saga across steps), maintainability (small versioned modules w/ contracts), testability, performance, extensibility (config-driven), cost. Name the modules/files and their input/output contracts.\nPRD:\n${prd.artifact}\n${PRINCIPLES}`
+      : `Revise the architecture to resolve the gaps.\nARCH:\n${p.artifact}\nGAPS:\n${J(p.verdict.gaps)}`,
+    (draft) => `Review this architecture. Pass ONLY if every PRD requirement AND every architecture principle is concretely addressed with named modules/contracts and no unaddressed high risk.\nPRD:\n${prd.artifact}\nARCH:\n${draft}`,
+    MAX_ROUNDS)
+  await commitStage('architecture', 'architecture + principle mechanisms + module contracts')
+}
+
+// ── STAGE 4: Plan (additive-aware; every task MUST declare concrete files) ───
+let tasks = []
+if (willRun('plan')) {
+  phase('Plan')
+  // Greenfield vs existing is a SCHEMA'D BOOLEAN (never a prose-length heuristic).
+  // Uncertain ⇒ treat as additive (the non-clobbering path).
+  const RA_SCHEMA = {
+    type: 'object', additionalProperties: false,
+    properties: { greenfield: { type: 'boolean' }, conventions: { type: 'string' } },
+    required: ['greenfield', 'conventions'],
+  }
+  let ra = null
+  for (let i = 1; i <= MAX_RETRY && !ra; i++) {
+    try { ra = await agent(`Audit the repo at ${REPO} ON DISK. Set greenfield=true ONLY if the tree is essentially empty (no package manifest, no real source tree). Otherwise greenfield=false and put in conventions the REAL structure + which capabilities already exist + where new features must live (real paths).`, { label: i === 1 ? 'plan:repo-audit' : `plan:repo-audit:r${i}`, phase: 'Plan', schema: RA_SCHEMA }) } catch (e) { log(`repo-audit attempt ${i} failed: ${String((e && e.message) || e).slice(0, 100)}`) }
+  }
+  ADDITIVE = ra ? !ra.greenfield : true
+  REPO_AUDIT = ra ? String(ra.conventions || '') : ''
+  // CLOBBER BACKSTOP (script-enforced, not prompt-only): a wrong greenfield=true
+  // would route the destructive scaffold branch over an existing repo. Probe the
+  // real tracked-file count; a non-trivial tree forces ADDITIVE (no-clobber).
+  if (!ADDITIVE) {
+    const probe = await agent(`In ${REPO}: run \`git ls-files | wc -l\` and return ONLY the integer count (no prose).`, { label: 'plan:greenfield-probe', phase: 'Plan' })
+    const n = parseInt((String(probe).match(/\d+/) || ['0'])[0], 10)
+    if (n > 10) { ADDITIVE = true; log(`⚠ repo-audit said greenfield but ${n} tracked files exist — forcing ADDITIVE (no-clobber)`) }
+  }
+  log(`Plan: repo is ${ADDITIVE ? 'EXISTING → additive build (plan the delta; never clobber)' : 'greenfield'}`)
+  const PLAN_SCHEMA = {
+    type: 'object', additionalProperties: false,
+    properties: { tasks: { type: 'array', items: {
+      type: 'object', additionalProperties: false,
+      properties: { id: { type: 'string' }, title: { type: 'string' }, files: { type: 'array', items: { type: 'string' }, minItems: 1 }, contract: { type: 'string' } },
+      required: ['id', 'title', 'files'],
+    } } },
+    required: ['tasks'],
+  }
+  const plan = await agent(
+    `Decompose the build into SMALL, INDEPENDENT, idempotent tasks. EACH task MUST list in files[] the concrete REAL repo-relative paths it will create/modify (at least one) — these are checked against the git diff later, so they must be the actual files. Prefer NEW files per task; put shared-file edits (barrels/routes/config) in their own dedicated task so they don't collide. Include observability/security/audit/test tasks. Return tasks[].\n${ADDITIVE ? `THIS IS AN EXISTING CODEBASE — plan ONLY the DELTA the spec requires; do NOT re-plan capabilities that already exist. Name the REAL existing files to create/extend, matching the conventions below.\nREPO CONVENTIONS (ground truth):\n${REPO_AUDIT}\n` : ''}ARCH:\n${arch.artifact}`,
+    { label: 'plan', phase: 'Plan', schema: PLAN_SCHEMA })
+  tasks = (plan.tasks || []).filter((t) => t && t.id && Array.isArray(t.files) && t.files.length).slice(0, cfg.maxTasks ?? 999)
+  log(`Plan: ${tasks.length} tasks (all with declared files)`)
+  await commitStage('plan', `${tasks.length} task contracts`)
+}
+
+// Partition tasks so concurrent agents never edit the same file: any file
+// claimed by >1 task ⇒ those tasks are SERIAL; the rest run in parallel.
+function partitionDisjoint(ts) {
+  const owners = {}
+  for (const t of ts) for (const f of (t.files || [])) { const k = norm(f); (owners[k] = owners[k] || []).push(t.id) }
+  const collidingIds = new Set()
+  for (const k of Object.keys(owners)) if (owners[k].length > 1) owners[k].forEach((id) => collidingIds.add(id))
+  return { parallelTasks: ts.filter((t) => !collidingIds.has(t.id)), serialTasks: ts.filter((t) => collidingIds.has(t.id)) }
+}
+
+// ── STAGE 5: Build (parallel + deterministic ground-truth gate) ──────────────
+const buildResults = []
+async function buildTask(task) {
+  const prompt = `Implement ONLY task ${task.id} ("${task.title}") in the repo at ${REPO}${ADDITIVE ? ' — an EXISTING codebase: ADD to it following its conventions; do NOT recreate or overwrite what already exists' : ', on top of the scaffold'}, per the architecture. You MUST create/modify the REAL files for this task — returning a description WITHOUT changing files on disk is a FAILURE and a git-diff check will catch it. Embody the principles in YOUR code: structured logging, input validation + per-action authz where relevant, idempotency, no secrets in logs.\nHARD RULES (other agents work in this SAME tree concurrently): touch ONLY this task's files (${(task.files || []).join(', ')}); do NOT edit package.json/lockfiles/shared barrels/config; do NOT run install or git. It's OK if the whole project doesn't typecheck yet.\nCONTRACT: ${task.contract || '(see architecture)'}\n${ADDITIVE ? `REPO CONVENTIONS:\n${REPO_AUDIT}\n` : ''}ARCH:\n${arch.artifact}\nReturn the exact files you wrote/modified (with line counts).`
+  const r = await withRetry(`build:${task.id}`, 'Build', prompt, MAX_RETRY)
+  return { id: task.id, title: task.title, ok: r.ok, attempts: r.attempts, summary: r.ok ? r.text : r.reason }
+}
+async function runBuild() {
+  phase('Build')
+  // Scaffold (greenfield) OR baseline (additive: NEVER recreate the tree). Both
+  // are guarded so a misclassification can neither clobber nor skip a skeleton.
+  const sc = await withRetry('build:scaffold', 'Build',
+    ADDITIVE
+      ? `This is an EXISTING repo — do NOT scaffold or recreate structure, and NEVER overwrite an existing file. Just ensure dependencies are installed and the project currently typechecks/builds clean as a BASELINE (fix only what is already broken; implement NO new features here). EDGE CASE: if there is in fact NO package manifest / source tree, scaffold a MINIMAL skeleton + observability layer (structured logging + request IDs + error tracking) first. Commit+push only if something changed (wf(build): baseline). Report the build command + result.\nREPO CONVENTIONS:\n${REPO_AUDIT}`
+      : `Scaffold the complete project skeleton in ${REPO} per the architecture: structure, package/config files, the cross-cutting OBSERVABILITY layer (structured logging + request IDs + error tracking), and install deps. GUARD: if a package manifest / source tree already exists, do NOT overwrite or recreate any existing file — only fill genuine gaps. Make typecheck/build pass on the skeleton, then commit+push (wf(build): scaffold).\nARCH:\n${arch.artifact}\nTASKS (for layout): ${J(tasks.map((t) => ({ id: t.id, title: t.title })))}`,
+    MAX_RETRY)
+  if (!sc.ok) log(`⚠ ${ADDITIVE ? 'baseline' : 'scaffold'} failed: ${sc.reason}`)
+  await commitStage('build-scaffold', ADDITIVE ? 'baseline build' : 'skeleton + observability layer')
+
+  // GROUND-TRUTH baseline: captured AFTER the baseline/scaffold commit so its
+  // incidental churn (lockfiles/config/formatting) can NEVER mask a hollow
+  // feature build. This value is memoized → stable across resume.
+  const baseRef = await gitRef('gt:base')
+
+  // Implement: parallel for disjoint-file tasks, serial for colliding ones.
+  const { parallelTasks, serialTasks } = partitionDisjoint(tasks)
+  if (serialTasks.length) log(`Build: ${parallelTasks.length} parallel + ${serialTasks.length} serial (shared-file) tasks`)
+  else log(`Build: ${tasks.length} tasks in parallel (retry ${MAX_RETRY}x each)`)
+  const impl = (await parallel(parallelTasks.map((t) => () => buildTask(t)))).filter(Boolean)
+  for (const t of serialTasks) impl.push(await buildTask(t))
+  const failed = impl.filter((r) => !r.ok)
+  buildResults.push(...impl)
+  if (failed.length) log(`⚠ ${failed.length}/${impl.length} tasks failed after retries: ${failed.map((f) => f.id).join(', ')} — integration backfills`)
+  await commitStage('build-parallel', `${impl.length - failed.length}/${impl.length} tasks`)
+
+  // Integration: wire + make the whole thing green; backfill failures.
+  await withRetry('build:integrate', 'Build',
+    `Integrate the build in ${REPO}.${failed.length ? ` First IMPLEMENT these failed/missing tasks per the architecture: ${J(failed.map((f) => f.id))}.` : ''} Add missing deps + wiring (barrels, routes, imports), install, then run typecheck+build+lint for the WHOLE project and fix every error until clean. Commit+push (wf(build): integrate). Report the exact commands + results.\nARCH:\n${arch.artifact}\nTASK SUMMARIES: ${J(impl.map((r) => ({ id: r.id, ok: r.ok, summary: String(r.summary).slice(0, 400) })))}`, MAX_RETRY)
+  await commitStage('build-integrate', 'integrated green build')
+
+  // ── DETERMINISTIC GROUND-TRUTH GATE ───────────────────────────────────────
+  // The build's word is NOT proof. Parse `git diff --numstat baseRef HEAD` in
+  // the SCRIPT: a task whose declared files show no real (>= MIN_ADDED-line)
+  // change is a GHOST → re-implement. Loops until every task lands or rounds
+  // exhaust; on exhaustion sets GROUND_TRUTH.clean=false which FORCES
+  // deployReady=false downstream (never a silent fall-through).
+  const declaredPaths = [...new Set(tasks.flatMap((t) => t.files || []))]
+  let lastGhosts = tasks.map((t) => t.id)
+  for (let g = 1; g <= MAX_GT; g++) {
+    const ev = await gitEvidence(baseRef, declaredPaths, `gt:evidence:r${g}`)
+    const noCommit = !!(ev.head && baseRef && norm(ev.head).slice(0, 12) === norm(baseRef).slice(0, 12))
+    const files = parseReal(ev.numstat)
+    const stubSet = toStubSet(ev.stubgrep)
+    const ignoredSet = toIgnoredSet(ev.ignored)
+    const ghosts = tasks.filter((t) => !taskLanded(t, files, stubSet))
+    lastGhosts = ghosts.map((t) => t.id)
+    // Tasks whose declared paths are ALL gitignored can never land — flag and stop
+    // (don't burn rounds re-implementing an un-landable path).
+    const ignoredTasks = tasks.filter((t) => (t.files || []).length && (t.files || []).every((f) => ignoredSet.has(norm(f)))).map((t) => t.id)
+    if (!noCommit && ghosts.length === 0 && files.length > 0) { GROUND_TRUTH = { clean: true, ghosts: [] }; log(`Ground truth r${g}: all ${tasks.length} tasks landed real files (${files.length} changed)`); break }
+    GROUND_TRUTH = { clean: false, ghosts: lastGhosts, ignored: ignoredTasks }
+    if (ignoredTasks.length) { log(`⛔ Ground truth r${g}: tasks target .gitignored paths (un-landable): ${ignoredTasks.join(', ')} — FIX the planned file paths; not retrying. deployReady forced false.`); break }
+    const note = [noCommit ? 'HEAD==baseRef: nothing committed' : '', String(ev.porcelain || '').trim() ? 'uncommitted changes present' : '', stubSet.size ? `${stubSet.size} stub-flagged file(s) excluded` : ''].filter(Boolean).join('; ')
+    log(`⛔ Ground truth r${g}: ${ghosts.length}/${tasks.length} GHOST task(s) with no real file on disk: ${lastGhosts.join(', ')}${note ? ` (${note})` : ''} — re-implementing for real`)
+    const ghostDetail = ghosts.map((t) => ({ id: t.id, title: t.title, files: t.files }))
+    await withRetry(`build:ground-truth:r${g}`, 'Build',
+      `GROUND-TRUTH FAILURE in ${REPO}: these planned tasks reported done but have NO real file change on disk (need >= ${MIN_ADDED} added lines of substantive code at the declared path — empty/placeholder/TODO stubs and pure re-export shims do NOT count): ${J(ghostDetail)}. This is${ADDITIVE ? ' an EXISTING repo' : ' a real project'} — you MUST create/modify the REAL files now with working code. Then install+wire+typecheck/build/lint green and COMMIT+push (wf(build): ground-truth backfill r${g}). Report each file written WITH line counts.\n${ADDITIVE ? `REPO CONVENTIONS:\n${REPO_AUDIT}\n` : ''}ARCH:\n${arch.artifact}`, MAX_RETRY)
+    await commitStage(`build-ground-truth-r${g}`, 'reimplemented ghost tasks')
+  }
+  if (!GROUND_TRUTH.clean) log(`⛔ Ground truth NOT clean after ${MAX_GT} rounds — unresolved: ${lastGhosts.join(', ')}. deployReady will be forced false.`)
+}
+if (willRun('build')) await runBuild()
+
+// ── STAGE 6: Verify (adversarial, ground-truth, bounded loop) ────────────────
+let verify = { passed: true, gaps: [] }
+if (willRun('verify')) {
+  phase('Verify')
+  const VSCHEMA = {
+    type: 'object', additionalProperties: false,
+    properties: {
+      passed: { type: 'boolean' },
+      buildGreen: { type: 'boolean' },
+      filesPresent: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { id: { type: 'string' }, present: { type: 'boolean' } }, required: ['id', 'present'] } },
+      gaps: { type: 'array', items: { type: 'string' } },
+    },
+    required: ['passed', 'buildGreen', 'filesPresent', 'gaps'],
+  }
+  // Seed gaps with any unresolved ground-truth ghosts so Verify MUST resolve them.
+  const seedGaps = GROUND_TRUTH.clean ? [] : [`Ground-truth ghosts (claimed built, no real file): ${GROUND_TRUTH.ghosts.join(', ')}`]
+  for (let r = 1; r <= MAX_ROUNDS; r++) {
+    verify = await agent(
+      `Adversarially VERIFY the repo at ${REPO} ON DISK — trust files, not prior claims. (0) For each EXPECTED task, confirm its declared files EXIST with real, non-stub content; return filesPresent[{id,present}]. (1) RUN typecheck+build+lint yourself for the whole project; set buildGreen. (2) Scan EVERY source file for stubs/placeholders/TODOs/empty surfaces — none allowed for planned tasks. (3) Spot-check the principles in the actual code: structured logging present? secrets NOT logged/leaked? idempotency on retryable ops? input validation/authz on entry points? Pass ONLY if every expected file exists, buildGreen, no stubs remain, and these checks hold. List concrete gaps.\nKNOWN UNRESOLVED (must fix): ${J(seedGaps)}\nTasks expected: ${J(tasks.map((t) => ({ id: t.id, title: t.title, files: t.files })))}`,
+      { label: `verify:r${r}`, phase: 'Verify', schema: VSCHEMA })
+    const absent = (verify.filesPresent || []).filter((f) => !f.present).map((f) => f.id)
+    const ok = verify.passed && verify.buildGreen && absent.length === 0
+    if (ok) { log(`Verify r${r}: PASS (build green, all files present)`); verify.passed = true; break }
+    const gaps = [...(verify.gaps || []), ...(absent.length ? [`Missing files for tasks: ${absent.join(', ')}`] : []), ...(verify.buildGreen ? [] : ['build/typecheck/lint not green'])]
+    verify.passed = false
+    log(`Verify r${r}: ${gaps.length} gap(s) — remediating`)
+    await withRetry(`verify:fix:r${r}`, 'Verify',
+      `Fix ALL of these gaps in ${REPO} with real code until the project builds/typechecks/lints clean and no stub remains, then commit+push (wf(verify): fix r${r}).\nGAPS:\n${J(gaps)}`, MAX_RETRY)
+    await commitStage(`verify-fix-r${r}`, 'resolved verification gaps')
+  }
+}
+
+// ── STAGE 7: QA (Testability incl. FAILURE scenarios + render-assert) ────────
+let qa = { passed: true, tiers: [] }
+if (willRun('qa')) {
+  phase('QA')
+  const QSCHEMA = {
+    type: 'object', additionalProperties: false,
+    properties: { passed: { type: 'boolean' }, command: { type: 'string' }, output: { type: 'string' }, surfacesCovered: { type: 'array', items: { type: 'string' } } },
+    required: ['passed', 'command', 'output'],
+  }
+  const tiers = ['unit', 'integration', 'e2e']
+  const results = []
+  for (const tier of tiers) {
+    const r = await withRetry(`qa:${tier}`, 'QA',
+      `Write and RUN ${tier.toUpperCase()} tests for the product in ${REPO} using its tooling. Cover the acceptance criteria AND failure scenarios (errors/timeouts/retries/bad input/unauthorized). You MUST exercise the NEW surfaces/tasks (${J(tasks.map((t) => t.title))}), not only the pre-existing app. For UI e2e: navigate to each new surface, assert the SUCCESS SURFACE renders real content, and FAIL on any console/page error (a gone-loading-screen is NOT proof). Fix root causes (never weaken assertions) until green. Report the command + a pasted tail of the test output.`, MAX_RETRY)
+    let v = { passed: false }
+    if (r.ok) v = await agent(`Verify the ${tier} tier in ${REPO} is genuinely green and meaningfully exercises the acceptance criteria + a failure scenario + the NEW surfaces. Return passed, the command, a pasted output tail, and surfacesCovered (which new surfaces/tasks the tier exercised). FAIL (passed=false) if it only covers the pre-existing app.`, { label: `qa:${tier}:verify`, phase: 'QA', schema: QSCHEMA })
+    results.push({ tier, passed: !!v.passed, surfacesCovered: v.surfacesCovered || [] })
+    log(`QA:${tier} — ${v.passed ? 'green' : 'NOT green'}`)
+  }
+  qa = { tiers: results, passed: results.every((t) => t.passed) }
+  await commitStage('qa', `tiers green=${qa.passed}`)
+}
+
+// ── STAGE 8: Acceptance (independent release gate + principle scorecard) ─────
+let acceptance = null
+if (willRun('acceptance')) {
+  phase('Acceptance')
+  const ASCHEMA = {
+    type: 'object', additionalProperties: false,
+    properties: {
+      deployReady: { type: 'boolean' },
+      criteria: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { id: { type: 'string' }, met: { type: 'boolean' }, evidence: { type: 'string' } }, required: ['id', 'met'] } },
+      principleScorecard: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { principle: { type: 'string' }, met: { type: 'boolean' }, note: { type: 'string' } }, required: ['principle', 'met'] } },
+      blockers: { type: 'array', items: { type: 'string' } },
+    },
+    required: ['deployReady', 'blockers'],
+  }
+  acceptance = await agent(
+    `You are the INDEPENDENT release gate. Be adversarial — inspect ${REPO} directly and RUN the build/tests. For each acceptance criterion decide met/not-met with evidence (map each to a real file/test). Score each of the 14 architecture principles met/not-met with a note. Declare deployReady true ONLY if every criterion is met, the build is green, all QA tiers pass, AND the build ground-truth is clean. HARD RULE: if groundTruth.clean is false or verify.passed is false, deployReady MUST be false and list those as blockers.\nSPEC:\n${intake.text}\ngroundTruth: ${J(GROUND_TRUTH)}\nverify.passed: ${J(!!verify.passed)}\nQA: ${J(qa)}\n${PRINCIPLES}`,
+    { label: 'acceptance:gate', phase: 'Acceptance', schema: ASCHEMA })
+  // Belt-and-suspenders: the script enforces the hard invariants regardless of the agent.
+  const forcedBlockers = []
+  if (!GROUND_TRUTH.clean) forcedBlockers.push(`Ground-truth ghosts unresolved: ${GROUND_TRUTH.ghosts.join(', ')}`)
+  if (willRun('verify') && !verify.passed) forcedBlockers.push('Verify did not pass')
+  if (willRun('qa') && !qa.passed) forcedBlockers.push('QA tiers not all green')
+  if (forcedBlockers.length) { acceptance.deployReady = false; acceptance.blockers = [...new Set([...(acceptance.blockers || []), ...forcedBlockers])] }
+  log(`Acceptance: deployReady=${acceptance.deployReady}, blockers=${(acceptance.blockers || []).length}`)
+}
+
+// ── STAGE 9: Manifest (Observability + Auditability: a committed run report) ─
+if (willRun('manifest')) {
+  phase('Manifest')
+  const deployReady = acceptance ? (!!acceptance.deployReady && GROUND_TRUTH.clean && (!willRun('verify') || verify.passed)) : null
+  const manifest = {
+    repo: REPO,
+    additive: ADDITIVE,
+    stagesRun: ORDER.filter(willRun),
+    groundTruth: GROUND_TRUTH,
+    build: buildResults.map((r) => ({ id: r.id, ok: r.ok, attempts: r.attempts })),
+    verify: { passed: !!verify.passed },
+    qa,
+    acceptance,
+    deployReady,
+  }
+  await agent(
+    `Write a run report to ${REPO}/docs/RUN-REPORT.md (Markdown) capturing this build: additive vs greenfield, stages run, the ground-truth verdict (clean + any ghost task ids), per-task build status + retry counts, QA tier results, acceptance criteria results, the 14-principle scorecard, final deployReady, and any blockers. Then commit+push (wf(manifest): run report). Create/modify ONLY that file.\nMANIFEST DATA:\n${J(manifest)}`,
+    { label: 'manifest:report', phase: 'Manifest' })
+  return manifest
+}
+
+return { repo: REPO, stagesRun: ORDER.filter(willRun), groundTruth: GROUND_TRUTH, note: 'stopped before manifest' }
