@@ -62,7 +62,12 @@ import './cli/delivery-action.js';
 import { startCliServer, stopCliServer } from './cli/socket-server.js';
 
 import type { ChannelAdapter, ChannelSetup } from './channels/adapter.js';
-import { initChannelAdapters, teardownChannelAdapters, getChannelAdapter, syncChannelConversations } from './channels/channel-registry.js';
+import {
+  initChannelAdapters,
+  teardownChannelAdapters,
+  getChannelAdapter,
+  syncChannelConversations,
+} from './channels/channel-registry.js';
 
 async function main(): Promise<void> {
   log.info('NanoClaw starting');
@@ -225,6 +230,12 @@ async function main(): Promise<void> {
           pushSnapshotNow();
         }
         return result;
+      },
+      // Read-only workspace browsing for the app (Agent group → Workspace).
+      // Path-safety + text/size policy live in group-files.ts.
+      onGroupFileRead: async (groupId: string, relPath: string) => {
+        const { readGroupFile } = await import('./group-files.js');
+        return readGroupFile(groupId, relPath);
       },
     });
     startDashboardPusher({ port: dashboardPort, secret: dashboardSecret, intervalMs: 60000 });

@@ -168,6 +168,8 @@ function collectSnapshot(): Record<string, unknown> {
     timestamp: new Date().toISOString(),
     assistant_name: ASSISTANT_NAME,
     uptime: Math.floor(process.uptime()),
+    host_version: readHostVersion(),
+    shared_skills: collectSharedSkills(),
     agent_groups: collectAgentGroups(),
     sessions: collectSessions(),
     channels: collectChannels(),
@@ -249,11 +251,13 @@ const BRAIN_FILE_CAP = 32 * 1024;
 function collectBrain(
   folder: string,
   sharedMd: string | null,
+  skillCatalog: Array<{ name: string; description: string | null }>,
 ): {
   claude_md: string | null;
   claude_local_md: string | null;
   shared_md: string | null;
   fragments: string[];
+  skills: Array<{ name: string; description: string | null }>;
 } | null {
   const dir = path.join(GROUPS_DIR, folder);
   const readCapped = (file: string): string | null => {
@@ -276,12 +280,77 @@ function collectBrain(
     } catch {
       /* no fragments dir */
     }
+    // Wired skills with descriptions: each skill-<name>.md fragment joined
+    // against the shared catalog (per-group skills without a catalog entry
+    // still appear, description null).
+    const skills = fragments
+      .filter((f) => f.startsWith('skill-'))
+      .map((f) => {
+        const name = f.replace(/^skill-/, '').replace(/\.md$/, '');
+        return { name, description: skillCatalog.find((s) => s.name === name)?.description ?? null };
+      });
     return {
       claude_md: readCapped('CLAUDE.md'),
       claude_local_md: readCapped('CLAUDE.local.md'),
       shared_md: sharedMd,
       fragments,
+      skills,
     };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Shared-skills catalog — container/skills/<name>/SKILL.md frontmatter
+ * (name + description). Read once per snapshot; doubles as the lookup table
+ * that enriches each group's skill fragments with descriptions.
+ */
+function collectSharedSkills(): Array<{ name: string; description: string | null }> {
+  try {
+    const skillsDir = path.join(process.cwd(), 'container', 'skills');
+    return fs
+      .readdirSync(skillsDir, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => {
+        let description: string | null = null;
+        try {
+          const head = fs.readFileSync(path.join(skillsDir, e.name, 'SKILL.md'), 'utf-8').slice(0, 2048);
+          const m = /^description:[ \t]*(.*)$/m.exec(head);
+          if (m) {
+            const inline = m[1].trim();
+            if (inline && !/^[>|][+-]?$/.test(inline)) {
+              description = inline;
+            } else {
+              // YAML block scalar (description: >- / |) — join the following
+              // indented lines until the first dedented one.
+              const after = head.slice(m.index + m[0].length).split('\n').slice(1);
+              const block: string[] = [];
+              for (const line of after) {
+                if (/^\s+\S/.test(line)) block.push(line.trim());
+                else break;
+              }
+              description = block.join(' ') || null;
+            }
+          }
+        } catch {
+          /* no SKILL.md */
+        }
+        return { name: e.name, description };
+      })
+      .sort((a, b) => a.name.localeCompare(b.name));
+  } catch {
+    return [];
+  }
+}
+
+/** Host package version (package.json at the project root). */
+function readHostVersion(): string | null {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf-8')) as {
+      version?: string;
+    };
+    return pkg.version ?? null;
   } catch {
     return null;
   }
@@ -305,6 +374,7 @@ function readSharedMd(): string | null {
 
 function collectAgentGroups() {
   const sharedMd = readSharedMd();
+  const skillCatalog = collectSharedSkills();
   return getAllAgentGroups().map((g) => {
     const sessions = getSessionsByAgentGroup(g.id);
     const running = sessions.filter((s) => s.container_status === 'running' || s.container_status === 'idle');
@@ -335,7 +405,7 @@ function collectAgentGroups() {
       folder: g.folder,
       agent_provider: g.agent_provider,
       container_config: getContainerConfig(g.id) ?? null,
-      brain: collectBrain(g.folder, sharedMd),
+      brain: collectBrain(g.folder, sharedMd, skillCatalog),
       sessionCount: sessions.length,
       runningSessions: running.length,
       wirings,
