@@ -246,9 +246,13 @@ const BRAIN_FILE_CAP = 32 * 1024;
  * packages) already travel via container_config. Best-effort: any read error
  * degrades to null/[] — the snapshot must never fail on a missing folder.
  */
-function collectBrain(folder: string): {
+function collectBrain(
+  folder: string,
+  sharedMd: string | null,
+): {
   claude_md: string | null;
   claude_local_md: string | null;
+  shared_md: string | null;
   fragments: string[];
 } | null {
   const dir = path.join(GROUPS_DIR, folder);
@@ -275,6 +279,7 @@ function collectBrain(folder: string): {
     return {
       claude_md: readCapped('CLAUDE.md'),
       claude_local_md: readCapped('CLAUDE.local.md'),
+      shared_md: sharedMd,
       fragments,
     };
   } catch {
@@ -282,7 +287,24 @@ function collectBrain(folder: string): {
   }
 }
 
+/**
+ * Global shared memory — container/CLAUDE.md, the shared base every agent
+ * imports via the `.claude-shared.md` symlink (the old groups/global/ dir was
+ * cut over into this file; see claude-md-compose.ts). Same for all groups, so
+ * read once per snapshot. Best-effort + capped like the per-group files.
+ */
+function readSharedMd(): string | null {
+  try {
+    const text = fs.readFileSync(path.join(process.cwd(), 'container', 'CLAUDE.md'), 'utf-8');
+    if (!text.trim()) return null;
+    return text.length > BRAIN_FILE_CAP ? `${text.slice(0, BRAIN_FILE_CAP)}\n… (truncated)` : text;
+  } catch {
+    return null;
+  }
+}
+
 function collectAgentGroups() {
+  const sharedMd = readSharedMd();
   return getAllAgentGroups().map((g) => {
     const sessions = getSessionsByAgentGroup(g.id);
     const running = sessions.filter((s) => s.container_status === 'running' || s.container_status === 'idle');
@@ -313,7 +335,7 @@ function collectAgentGroups() {
       folder: g.folder,
       agent_provider: g.agent_provider,
       container_config: getContainerConfig(g.id) ?? null,
-      brain: collectBrain(g.folder),
+      brain: collectBrain(g.folder, sharedMd),
       sessionCount: sessions.length,
       runningSessions: running.length,
       wirings,
