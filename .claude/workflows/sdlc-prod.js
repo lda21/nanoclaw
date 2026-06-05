@@ -175,6 +175,7 @@ const RAW_SCHEMA = {
     porcelain: { type: 'string' },   // raw `git status --porcelain` (uncommitted leftovers)
     stubgrep: { type: 'string' },    // raw `git grep -nE <stub markers>` over the changed files
     ignored: { type: 'string' },     // raw `git check-ignore` over the declared task paths
+    sizes: { type: 'string' },       // raw `wc -l` over the declared task paths (tree reconciliation)
   },
   required: ['head', 'numstat', 'porcelain'],
 }
@@ -186,9 +187,9 @@ const STUB_MARKERS = 'TODO|FIXME|coming soon|not implemented|unimplemented|place
 async function gitEvidence(baseRef, declaredPaths, label) {
   const dp = (declaredPaths || []).slice(0, 200).map((p) => `'${String(p).replace(/'/g, '')}'`).join(' ')
   const out = await agent(
-    `In ${REPO}, gather GROUND-TRUTH git evidence — do NOT modify anything, do NOT summarize. Run and paste RAW verbatim output for each:\n1) \`git rev-parse HEAD\` -> head\n2) \`git diff --numstat --no-renames ${baseRef} HEAD\` -> numstat (one line per file: "<added>\\t<deleted>\\t<path>")\n3) \`git status --porcelain\` -> porcelain\n4) take the file paths from the numstat output and run \`git grep -nIE "${STUB_MARKERS}" -- <those paths>\` -> stubgrep (raw; empty if none match)\n5) \`git check-ignore ${dp || '/dev/null'}\` -> ignored (raw list of any of those paths git would ignore; empty if none)\nPaste exact command output; no commentary.`,
+    `In ${REPO}, gather GROUND-TRUTH git evidence — do NOT modify anything, do NOT summarize. Run and paste RAW verbatim output for each:\n1) \`git rev-parse HEAD\` -> head\n2) \`git diff --numstat --no-renames ${baseRef} HEAD\` -> numstat (one line per file: "<added>\\t<deleted>\\t<path>")\n3) \`git status --porcelain\` -> porcelain\n4) take the file paths from the numstat output and run \`git grep -nIE "${STUB_MARKERS}" -- <those paths>\` -> stubgrep (raw; empty if none match)\n5) \`git check-ignore ${dp || '/dev/null'}\` -> ignored (raw list of any of those paths git would ignore; empty if none)\n6) \`wc -l ${dp || '/dev/null'}\` -> sizes (raw "<lines> <path>" output; missing files may error — include whatever wc prints)\nPaste exact command output; no commentary.`,
     { label, phase: 'Build', schema: RAW_SCHEMA })
-  return out && typeof out === 'object' ? out : { head: '', numstat: '', porcelain: '', stubgrep: '', ignored: '' }
+  return out && typeof out === 'object' ? out : { head: '', numstat: '', porcelain: '', stubgrep: '', ignored: '', sizes: '' }
 }
 const IGNORE_PATH = /(^|\/)(node_modules|dist|build|coverage|\.expo|\.next|\.turbo)\//
 const LOCK_PATH = /(package-lock\.json|pnpm-lock\.yaml|bun\.lock(b)?|yarn\.lock)$/
@@ -214,28 +215,60 @@ function parseReal(numstat) {
   return files
 }
 function norm(p) { return String(p).replace(/^\.?\/*/, '').toLowerCase() }
-function toStubSet(stubgrep) {
-  return new Set(String(stubgrep || '').split('\n').map((l) => norm(l.split(':')[0].trim())).filter(Boolean))
+// Marker DENSITY rule: one "placeholder"/"TODO" inside a substantial file (CSS
+// placeholder:, env-example values, CI placeholder secrets) is NOT evidence of a
+// hollow build — that false positive ghosted a real 140-line ci.yml for 3 straight
+// rounds (T19, run wf_c6fc100f). A file is stub-flagged only when marker hits are
+// dense (>=3) or the change itself is thin (< 2*MIN_ADDED added lines).
+function toStubSet(stubgrep, files) {
+  const hits = {}
+  for (const l of String(stubgrep || '').split('\n')) {
+    const p = norm(l.split(':')[0].trim())
+    if (p) hits[p] = (hits[p] || 0) + 1
+  }
+  const added = {}
+  for (const f of files || []) added[norm(f.path)] = f.added
+  return new Set(Object.keys(hits).filter((p) => hits[p] >= 3 || (added[p] !== undefined && added[p] < MIN_ADDED * 2)))
 }
 function toIgnoredSet(ignored) {
   return new Set(String(ignored || '').split('\n').map((l) => norm(l.trim().split('\t').pop())).filter(Boolean))
+}
+// Parse raw `wc -l` output into a path -> line-count map (tree reconciliation).
+function toSizeMap(sizes) {
+  const m = {}
+  for (const l of String(sizes || '').split('\n')) {
+    const mm = l.trim().match(/^(\d+)\s+(.+)$/)
+    if (mm && mm[2].trim() !== 'total') m[norm(mm[2])] = parseInt(mm[1], 10)
+  }
+  return m
 }
 // Suffix match only — the changed path equals the declared path or ENDS WITH it
 // (declared is a suffix of changed). The reverse direction is dropped: a declared
 // path being a suffix of a shorter changed path is never evidence. Requires
 // >= MIN_ADDED added lines AND the file not flagged a stub by the marker scan.
-function fileLanded(declared, files, stubSet) {
+// TREE RECONCILIATION fallback: a declared file absent from the diff window but
+// already ON DISK with >= MIN_ADDED lines (landed in an earlier window, or
+// pre-existing in an additive run) is not a ghost — re-implementing it burns
+// rounds for nothing (T19, run wf_c6fc100f).
+function fileLanded(declared, files, stubSet, sizeMap) {
   const nf = norm(declared)
-  return files.some((ch) => {
+  const inDiff = files.some((ch) => {
     if (ch.added < MIN_ADDED) return false
     const nc = norm(ch.path)
     if (stubSet && stubSet.has(nc)) return false
     return nc === nf || nc.endsWith('/' + nf)
   })
+  if (inDiff) return true
+  if (sizeMap) {
+    for (const k of Object.keys(sizeMap)) {
+      if ((k === nf || k.endsWith('/' + nf)) && sizeMap[k] >= MIN_ADDED && !(stubSet && stubSet.has(k))) return true
+    }
+  }
+  return false
 }
-function taskLanded(task, files, stubSet) {
+function taskLanded(task, files, stubSet, sizeMap) {
   if (!task || !task.files || !task.files.length) return false // unprovable ⇒ ghost (fail closed)
-  return task.files.some((f) => fileLanded(f, files, stubSet))
+  return task.files.some((f) => fileLanded(f, files, stubSet, sizeMap))
 }
 
 // ── STAGE 1: Intake ──────────────────────────────────────────────────────────
@@ -292,8 +325,14 @@ if (willRun('plan')) {
   // would route the destructive scaffold branch over an existing repo. Probe the
   // real tracked-file count; a non-trivial tree forces ADDITIVE (no-clobber).
   if (!ADDITIVE) {
-    const probe = await agent(`In ${REPO}: run \`git ls-files | wc -l\` and return ONLY the integer count (no prose).`, { label: 'plan:greenfield-probe', phase: 'Plan' })
-    const n = parseInt((String(probe).match(/\d+/) || ['0'])[0], 10)
+    // SCRIPT counts path-shaped lines itself — a bare integer can be invented
+    // without running anything (probe fabrication: run wf_c6fc100f returned "788"
+    // against a 5-file tree, zero tool calls). A full path listing is checkable
+    // evidence; an undercount is safe because only crossing the threshold flips.
+    const P_SCHEMA = { type: 'object', additionalProperties: false, properties: { rawListing: { type: 'string' } }, required: ['rawListing'] }
+    let probe = null
+    try { probe = await agent(`In ${REPO}: run \`git ls-files\` and return rawListing = the COMPLETE raw output VERBATIM (one path per line, no commentary, no counts, no truncation). If the repo has no commits yet, return rawListing="".`, { label: 'plan:greenfield-probe', phase: 'Plan', schema: P_SCHEMA }) } catch (e) { log(`greenfield-probe failed (${String((e && e.message) || e).slice(0, 80)}) — keeping audit verdict`) }
+    const n = String((probe && probe.rawListing) || '').split('\n').map((l) => l.trim()).filter((l) => l && !/\s/.test(l) && !/^\d+$/.test(l)).length
     if (n > 10) { ADDITIVE = true; log(`⚠ repo-audit said greenfield but ${n} tracked files exist — forcing ADDITIVE (no-clobber)`) }
   }
   log(`Plan: repo is ${ADDITIVE ? 'EXISTING → additive build (plan the delta; never clobber)' : 'greenfield'}`)
@@ -376,9 +415,10 @@ async function runBuild() {
     const ev = await gitEvidence(baseRef, declaredPaths, `gt:evidence:r${g}`)
     const noCommit = !!(ev.head && baseRef && norm(ev.head).slice(0, 12) === norm(baseRef).slice(0, 12))
     const files = parseReal(ev.numstat)
-    const stubSet = toStubSet(ev.stubgrep)
+    const stubSet = toStubSet(ev.stubgrep, files)
     const ignoredSet = toIgnoredSet(ev.ignored)
-    const ghosts = tasks.filter((t) => !taskLanded(t, files, stubSet))
+    const sizeMap = toSizeMap(ev.sizes)
+    const ghosts = tasks.filter((t) => !taskLanded(t, files, stubSet, sizeMap))
     lastGhosts = ghosts.map((t) => t.id)
     // Tasks whose declared paths are ALL gitignored can never land — flag and stop
     // (don't burn rounds re-implementing an un-landable path).
