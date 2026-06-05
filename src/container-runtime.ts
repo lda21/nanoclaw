@@ -33,15 +33,45 @@ export function stopContainer(name: string): void {
   execSync(`${CONTAINER_RUNTIME_BIN} stop -t 1 ${name}`, { stdio: 'pipe' });
 }
 
+/** One `docker info` probe. Returns true when the daemon answers. */
+function runtimeUp(): boolean {
+  try {
+    execSync(`${CONTAINER_RUNTIME_BIN} info`, { stdio: 'pipe', timeout: 10000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Ensure the container runtime is running, starting it if needed. */
 export function ensureContainerRuntimeRunning(): void {
-  try {
-    execSync(`${CONTAINER_RUNTIME_BIN} info`, {
-      stdio: 'pipe',
-      timeout: 10000,
-    });
+  if (runtimeUp()) {
     log.debug('Container runtime already running');
-  } catch (err) {
+    return;
+  }
+
+  // SELF-HEAL (macOS): Docker Desktop quits on updates/reboots and used to
+  // take the whole host down with it (FATAL → launchd crash-loop → every
+  // channel silent). Launch it and wait up to ~90s before giving up.
+  if (os.platform() === 'darwin') {
+    log.warn('Container runtime unreachable — attempting to start Docker Desktop');
+    try {
+      execSync('open -ga Docker', { stdio: 'pipe', timeout: 15000 });
+      const deadline = Date.now() + 90_000;
+      while (Date.now() < deadline) {
+        execSync('sleep 3');
+        if (runtimeUp()) {
+          log.info('Container runtime recovered after auto-start');
+          return;
+        }
+      }
+    } catch (startErr) {
+      log.error('Docker Desktop auto-start failed', { err: startErr });
+    }
+  }
+
+  {
+    const err = new Error('docker info failed after auto-start attempt');
     log.error('Failed to reach container runtime', { err });
     console.error('\n╔════════════════════════════════════════════════════════════════╗');
     console.error('║  FATAL: Container runtime failed to start                      ║');
