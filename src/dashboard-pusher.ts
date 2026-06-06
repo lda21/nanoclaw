@@ -324,7 +324,10 @@ function collectSharedSkills(): Array<{ name: string; description: string | null
             } else {
               // YAML block scalar (description: >- / |) — join the following
               // indented lines until the first dedented one.
-              const after = head.slice(m.index + m[0].length).split('\n').slice(1);
+              const after = head
+                .slice(m.index + m[0].length)
+                .split('\n')
+                .slice(1);
               const block: string[] = [];
               for (const line of after) {
                 if (/^\s+\S/.test(line)) block.push(line.trim());
@@ -523,7 +526,13 @@ function collectTokens() {
   const nameMap = new Map(agentGroups.map((g) => [g.id, g.name]));
 
   if (fs.existsSync(sessionsDir)) {
-    for (const agDir of fs.readdirSync(sessionsDir).filter((d) => d.startsWith('ag-'))) {
+    // ALL agent-group dirs — ids are 'ag-<ts>-<rand>' for host-created groups
+    // but bare UUIDs for others (the Agent Office roster); the old 'ag-'
+    // prefix filter silently dropped every UUID group's transcripts.
+    for (const agDir of fs
+      .readdirSync(sessionsDir, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
+      .map((e) => e.name)) {
       const entries = scanJsonlTokens(path.join(sessionsDir, agDir));
       allEntries.push(...entries.map((e) => ({ ...e, agentGroupId: agDir })));
     }
@@ -723,7 +732,13 @@ function collectActivity() {
   const cutoff = new Date(now - 86400000).toISOString();
 
   try {
-    for (const agDir of fs.readdirSync(sessionsDir).filter((d) => d.startsWith('ag-'))) {
+    // ALL agent-group dirs — ids are 'ag-<ts>-<rand>' for host-created groups
+    // but bare UUIDs for others (the Agent Office roster); the old 'ag-'
+    // prefix filter silently dropped every UUID group's transcripts.
+    for (const agDir of fs
+      .readdirSync(sessionsDir, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
+      .map((e) => e.name)) {
       const agPath = path.join(sessionsDir, agDir);
       for (const sessDir of fs.readdirSync(agPath).filter((d) => d.startsWith('sess-'))) {
         for (const [dbName, direction] of [
@@ -770,7 +785,13 @@ function collectMessages() {
   const limit = 50;
 
   try {
-    for (const agDir of fs.readdirSync(sessionsDir).filter((d) => d.startsWith('ag-'))) {
+    // ALL agent-group dirs — ids are 'ag-<ts>-<rand>' for host-created groups
+    // but bare UUIDs for others (the Agent Office roster); the old 'ag-'
+    // prefix filter silently dropped every UUID group's transcripts.
+    for (const agDir of fs
+      .readdirSync(sessionsDir, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
+      .map((e) => e.name)) {
       const agPath = path.join(sessionsDir, agDir);
       for (const sessDir of fs.readdirSync(agPath).filter((d) => d.startsWith('sess-'))) {
         const inbound: unknown[] = [];
