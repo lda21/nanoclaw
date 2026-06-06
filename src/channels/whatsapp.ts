@@ -685,6 +685,21 @@ registerChannelAdapter('whatsapp', {
 
       sock.ev.on('creds.update', saveCreds);
 
+      // Group joins/creations — Baileys emits groups.upsert the moment this
+      // account is added to (or creates) a group. Surfacing it via onMetadata
+      // makes discovery instant: add the bot → host registers the group →
+      // owner's DM agent offers onboarding — no first message required.
+      sock.ev.on('groups.upsert', (groups) => {
+        for (const g of groups) {
+          if (!g.id?.endsWith('@g.us')) continue;
+          try {
+            setupConfig.onMetadata(g.id, g.subject ?? undefined, true);
+          } catch (err) {
+            log.warn('groups.upsert metadata hook failed', { err: String(err), jid: g.id });
+          }
+        }
+      });
+
       // LID ↔ phone mapping updates (v7 replaces chats.phoneNumberShare)
       sock.ev.on('lid-mapping.update', ({ lid, pn }) => {
         const lidUser = lid?.split('@')[0].split(':')[0];
