@@ -88,12 +88,10 @@ describe('provisionAgent', () => {
     expect(r.sessionId).toBeTruthy();
     expect(vi.mocked(wakeContainer)).toHaveBeenCalled();
     const Database = (await import('better-sqlite3')).default;
-    const inbound = new Database(
-      path.join(TEST_DIR, 'data', 'v2-sessions', r.agentGroupId, r.sessionId, 'inbound.db'),
-    );
-    const row = inbound
-      .prepare("SELECT content FROM messages_in WHERE id LIKE 'provision-%'")
-      .get() as { content: string } | undefined;
+    const inbound = new Database(path.join(TEST_DIR, 'data', 'v2-sessions', r.agentGroupId, r.sessionId, 'inbound.db'));
+    const row = inbound.prepare("SELECT content FROM messages_in WHERE id LIKE 'provision-%'").get() as
+      | { content: string }
+      | undefined;
     inbound.close();
     expect(row).toBeTruthy();
     const intro = (JSON.parse(row!.content) as { text: string }).text;

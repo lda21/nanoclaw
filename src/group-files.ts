@@ -12,9 +12,15 @@
  */
 import fs from 'fs';
 import path from 'path';
+import { execFileSync } from 'child_process';
+import crypto from 'crypto';
 
 import { getAgentGroup } from './db/agent-groups.js';
 import { DATA_DIR, GROUPS_DIR } from './config.js';
+
+/** launchd PATH lacks /opt/homebrew/bin — resolve ffmpeg explicitly. */
+const FFMPEG_BIN =
+  ['/opt/homebrew/bin/ffmpeg', '/usr/local/bin/ffmpeg', '/usr/bin/ffmpeg'].find((p2) => fs.existsSync(p2)) ?? 'ffmpeg';
 
 const FILE_CAP = 64 * 1024;
 /** Media (image/audio) is served base64 up to this cap — voice notes and
@@ -108,9 +114,38 @@ async function readFromRoot(root: string, relPath: string): Promise<GroupFileRes
 
   // Media (images / voice notes) → base64 with a mime so the app can render
   // or play it inline.
-  const mime = MEDIA_MIME[path.extname(real).toLowerCase()];
+  const ext = path.extname(real).toLowerCase();
+  const mime = MEDIA_MIME[ext];
   if (mime) {
     if (stat.size > MEDIA_CAP) return { ok: false, error: 'media file too large to view' };
+    // OGG/Opus (WhatsApp voice notes) is undecodable on iOS — AVPlayer plays
+    // silence. Transcode to AAC/m4a once via ffmpeg (cached by content path)
+    // so every client can play it. Fail open to the original bytes when
+    // ffmpeg is unavailable.
+    if (ext === '.ogg' || ext === '.opus') {
+      try {
+        const cacheDir = path.join('/tmp', 'nanoclaw-voice-cache');
+        fs.mkdirSync(cacheDir, { recursive: true });
+        const key = crypto.createHash('sha1').update(real).digest('hex');
+        const m4a = path.join(cacheDir, `${key}.m4a`);
+        if (!fs.existsSync(m4a)) {
+          execFileSync(FFMPEG_BIN, ['-y', '-i', real, '-c:a', 'aac', '-b:a', '64k', m4a], {
+            stdio: 'pipe',
+            timeout: 30_000,
+          });
+        }
+        return {
+          ok: true,
+          kind: 'file',
+          mime: 'audio/mp4',
+          encoding: 'base64',
+          content: fs.readFileSync(m4a).toString('base64'),
+          truncated: false,
+        };
+      } catch {
+        /* fall through to the original ogg bytes */
+      }
+    }
     return {
       ok: true,
       kind: 'file',
@@ -137,7 +172,6 @@ async function readFromRoot(root: string, relPath: string): Promise<GroupFileRes
     truncated,
   };
 }
-
 
 /**
  * Read a file from a SESSION directory — used to serve message attachments

@@ -177,6 +177,14 @@ export function provisionAgent(args: ProvisionArgs): ProvisionResult {
     log.warn('Provision kickoff wake failed — host-sweep will retry', { sessionId: session.id, err: String(err) }),
   );
 
-  log.info('Agent provisioned', { agentGroupId, name, folder, messagingGroupId: mg.id, wiringId, chatDest, sessionId: session.id });
+  log.info('Agent provisioned', {
+    agentGroupId,
+    name,
+    folder,
+    messagingGroupId: mg.id,
+    wiringId,
+    chatDest,
+    sessionId: session.id,
+  });
   return { agentGroupId, folder, wiringId, personaCreated, sessionId: session.id };
 }

@@ -653,7 +653,11 @@ function collectContextWindows() {
   const agentGroups = getAllAgentGroups();
   const nameMap = new Map(agentGroups.map((g) => [g.id, g.name]));
 
-  for (const agDir of fs.readdirSync(sessionsDir).filter((d) => d.startsWith('ag-'))) {
+  // Scan every dir that maps to a LIVE agent group. Keying on the DB roster
+  // (not an 'ag-' prefix) both includes UUID-id groups — the prefix filter
+  // hid the whole office roster from Context windows — and excludes leftover
+  // dirs of deleted groups, which otherwise surface as a bare session UUID.
+  for (const agDir of fs.readdirSync(sessionsDir).filter((d) => nameMap.has(d))) {
     const claudeDir = path.join(sessionsDir, agDir, '.claude-shared', 'projects');
     if (!fs.existsSync(claudeDir)) continue;
 
