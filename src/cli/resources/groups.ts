@@ -149,6 +149,26 @@ registerResource({
         return { deleted: id, removed };
       },
     },
+    provision: {
+      access: 'approval',
+      description:
+        'Atomically provision a NEW agent for a chat: agent group + starter persona + assistant_name + ' +
+        'always-on wiring + channel destination, in one call. Use --messaging-group-id <mg-id> ' +
+        '--name <AgentName> [--purpose "<one line>"]. Refuses chats that already have a wired agent. ' +
+        'The agent answers every message in the chat and greets it on first contact.',
+      handler: async (args) => {
+        const messagingGroupId = args['messaging-group-id'] as string | undefined;
+        const name = args.name as string | undefined;
+        if (!messagingGroupId) throw new Error('--messaging-group-id is required');
+        if (!name) throw new Error('--name is required');
+        const { provisionAgent } = await import('../../provision-agent.js');
+        return provisionAgent({
+          messagingGroupId,
+          name,
+          purpose: (args.purpose as string | undefined) ?? undefined,
+        });
+      },
+    },
     restart: {
       access: 'approval',
       description:

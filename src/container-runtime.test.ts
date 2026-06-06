@@ -72,13 +72,29 @@ describe('ensureContainerRuntimeRunning', () => {
     expect(log.debug).toHaveBeenCalledWith('Container runtime already running');
   });
 
-  it('throws when docker info fails', () => {
-    mockExecSync.mockImplementationOnce(() => {
+  it('throws when docker info fails and the runtime cannot be started', () => {
+    // EVERY call fails: the initial probe, the macOS `open -ga Docker`
+    // self-heal attempt, and any re-probe — terminal FATAL.
+    mockExecSync.mockImplementation(() => {
       throw new Error('Cannot connect to the Docker daemon');
     });
 
     expect(() => ensureContainerRuntimeRunning()).toThrow('Container runtime is required but failed to start');
     expect(log.error).toHaveBeenCalled();
+  });
+
+  it('self-heals on macOS: starts Docker Desktop and recovers without throwing', () => {
+    if (process.platform !== 'darwin') return; // the auto-start path is macOS-only
+    // Call 1 (docker info) fails → open -ga Docker ok → sleep ok → info ok.
+    mockExecSync
+      .mockImplementationOnce(() => {
+        throw new Error('Cannot connect to the Docker daemon');
+      })
+      .mockImplementation(() => '');
+
+    expect(() => ensureContainerRuntimeRunning()).not.toThrow();
+    expect(mockExecSync).toHaveBeenCalledWith('open -ga Docker', expect.any(Object));
+    expect(log.info).toHaveBeenCalledWith('Container runtime recovered after auto-start');
   });
 });
 

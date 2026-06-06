@@ -128,6 +128,16 @@ async function main(): Promise<void> {
           name,
           isGroup,
         });
+        // Chat-first onboarding: a group we've never seen → register it
+        // (unwired) and have the owner's DM agent offer to provision an
+        // agent for it. No-op for known groups (the common path).
+        if (isGroup) {
+          void import('./group-onboarding.js')
+            .then(({ handleDiscoveredGroup }) =>
+              handleDiscoveredGroup(adapter.channelType, platformId, name),
+            )
+            .catch((err) => log.warn('Group onboarding hook failed', { err: String(err) }));
+        }
       },
       onAction(questionId, selectedOption, userId) {
         dispatchResponse({
