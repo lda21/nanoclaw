@@ -1,6 +1,6 @@
 export const meta = {
   name: 'sdlc-prod',
-  description: 'Hardened SDLC build workflow: additive-aware planning, parallel build with retry, a deterministic git-numstat GROUND-TRUTH gate (the SCRIPT parses the diff — a build that wrote no real files is re-run, never shipped, and forces deployReady=false), per-stage commits, adversarial verify, render-asserting QA — and it drives the built system to embody 14 architecture principles.',
+  description: 'Hardened SDLC build workflow (v3): spec-contract gate (criteria→task coverage matrix, script-enforced; deferral detection), parallel build with retry, a deterministic git-numstat GROUND-TRUTH gate (the SCRIPT parses the diff — a build that wrote no real files is re-run, never shipped, and forces deployReady=false), post-build adversarial refuter wave, per-stage commits, parallel render-asserting QA tiers, a lessons stage — and it drives the built system to embody 14 architecture principles.',
   whenToUse: 'Any substantial build/extend on a repo where you want production-grade orchestration AND a product that is observable, durable, resilient, idempotent, secure, auditable, testable. Detects greenfield vs existing repo (schema boolean) and plans the delta either way; never clobbers an existing tree. Pass {repo, brief} (NOT a prose string).',
   phases: [
     { title: 'Intake' },
@@ -8,6 +8,7 @@ export const meta = {
     { title: 'Architecture' },
     { title: 'Plan' },
     { title: 'Build' },
+    { title: 'Refute' },
     { title: 'Verify' },
     { title: 'QA' },
     { title: 'Acceptance' },
@@ -94,6 +95,10 @@ Extensibility (config-driven steps), Cost-efficiency (scale to demand, no pollin
 let REPO_AUDIT = ''
 let ADDITIVE = false
 let GROUND_TRUTH = { clean: true, ghosts: [] } // build correctness verdict; honored by Verify/Acceptance/Manifest
+let CRITERIA = [] // structured acceptance criteria from intake (the spec contract)
+let UNCOVERED = [] // criteria no plan task claims — forced into acceptance as blockers
+let REFUTE_GAPS = [] // surviving refuter evidence — seeds Verify's known-unresolved list
+let DEFERRED_FLAGS = [] // build summaries that tried to defer scope (run wf_c6fc100f failure class)
 
 // ── generic helpers ──────────────────────────────────────────────────────────
 
@@ -179,9 +184,19 @@ const RAW_SCHEMA = {
   },
   required: ['head', 'numstat', 'porcelain'],
 }
-async function gitRef(label) {
+// FABRICATION TRIPWIRE: a single bare hash is trivially inventable (the "788"
+// class). Two independent probes must AGREE on the hash; disagreement triggers
+// a tiebreaker. Forging requires two agents inventing the SAME 40-hex string.
+async function gitRefOnce(label) {
   const r = await agent(`In ${REPO}: run \`git rev-parse HEAD\` and return ONLY the 40-char hash as your entire output (no prose).`, { label, phase: 'Build' })
-  return String(typeof r === 'string' ? r : '').trim().split(/\s+/)[0] || ''
+  return (String(typeof r === 'string' ? r : '').match(/\b[0-9a-f]{40}\b/i) || [''])[0]
+}
+async function gitRef(label) {
+  const [a, b] = await parallel([() => gitRefOnce(`${label}:p1`), () => gitRefOnce(`${label}:p2`)])
+  if (a && b && a === b) return a
+  log(`⚠ ${label}: baseRef probes disagree (${String(a).slice(0, 8)} vs ${String(b).slice(0, 8)}) — tiebreaking`)
+  const c = await gitRefOnce(`${label}:p3`)
+  return c === a || c === b ? c : c || a || b || ''
 }
 const STUB_MARKERS = 'TODO|FIXME|coming soon|not implemented|unimplemented|placeholder|stub'
 async function gitEvidence(baseRef, declaredPaths, label) {
@@ -276,6 +291,26 @@ phase('Intake')
 const NORTH_STAR = `BRIEF:\n${BRIEF}\n\n${PRINCIPLES}\nImplementation target repo: ${REPO}.`
 const intake = await withRetry('intake', 'Intake',
   `Read the repo at ${REPO} (its stack/conventions) and distill the brief into a crisp spec: problem, goals, constraints, and a numbered list of testable ACCEPTANCE CRITERIA. Fold the architecture principles in as explicit non-functional requirements with a concrete check for each.\n${NORTH_STAR}`, MAX_RETRY)
+// SPEC CONTRACT: extract the criteria as structured data. Plan coverage, build
+// prompts, and the acceptance gate all bind to THESE ids — a criterion that no
+// task claims is surfaced by the SCRIPT, not left to an agent's judgment
+// (run wf_c6fc100f shipped 4 unmet criteria a build agent quietly deferred).
+const CRIT_SCHEMA = {
+  type: 'object', additionalProperties: false,
+  properties: { criteria: { type: 'array', items: {
+    type: 'object', additionalProperties: false,
+    properties: { id: { type: 'string' }, check: { type: 'string' } },
+    required: ['id', 'check'],
+  } } },
+  required: ['criteria'],
+}
+try {
+  const c = await agent(
+    `Extract EVERY acceptance criterion from this spec as structured data — functional AND non-functional. id = short stable slug (e.g. "AC1-routes", "NFR-security"); check = the testable statement VERBATIM enough to verify against. Do not merge, drop, or soften any criterion.\nSPEC:\n${intake.text}`,
+    { label: 'intake:criteria', phase: 'Intake', schema: CRIT_SCHEMA })
+  CRITERIA = (c.criteria || []).filter((x) => x && x.id && x.check)
+} catch (e) { log(`intake:criteria extraction failed (${String((e && e.message) || e).slice(0, 80)}) — coverage gate degrades to prompt-only`) }
+log(`Intake: ${CRITERIA.length} acceptance criteria extracted as the spec contract`)
 await commitStage('intake', 'spec + acceptance criteria + principle NFRs')
 
 // ── STAGE 2: PRD ──────────────────────────────────────────────────────────────
@@ -340,16 +375,27 @@ if (willRun('plan')) {
     type: 'object', additionalProperties: false,
     properties: { tasks: { type: 'array', items: {
       type: 'object', additionalProperties: false,
-      properties: { id: { type: 'string' }, title: { type: 'string' }, files: { type: 'array', items: { type: 'string' }, minItems: 1 }, contract: { type: 'string' } },
+      properties: { id: { type: 'string' }, title: { type: 'string' }, files: { type: 'array', items: { type: 'string' }, minItems: 1 }, contract: { type: 'string' }, covers: { type: 'array', items: { type: 'string' } } },
       required: ['id', 'title', 'files'],
     } } },
     required: ['tasks'],
   }
-  const plan = await agent(
-    `Decompose the build into SMALL, INDEPENDENT, idempotent tasks. EACH task MUST list in files[] the concrete REAL repo-relative paths it will create/modify (at least one) — these are checked against the git diff later, so they must be the actual files. Prefer NEW files per task; put shared-file edits (barrels/routes/config) in their own dedicated task so they don't collide. Include observability/security/audit/test tasks. Return tasks[].\n${ADDITIVE ? `THIS IS AN EXISTING CODEBASE — plan ONLY the DELTA the spec requires; do NOT re-plan capabilities that already exist. Name the REAL existing files to create/extend, matching the conventions below.\nREPO CONVENTIONS (ground truth):\n${REPO_AUDIT}\n` : ''}ARCH:\n${arch.artifact}`,
-    { label: 'plan', phase: 'Plan', schema: PLAN_SCHEMA })
-  tasks = (plan.tasks || []).filter((t) => t && t.id && Array.isArray(t.files) && t.files.length).slice(0, cfg.maxTasks ?? 999)
-  log(`Plan: ${tasks.length} tasks (all with declared files)`)
+  const critList = CRITERIA.length ? `\nACCEPTANCE CRITERIA (the spec contract — EVERY id below MUST appear in some task's covers[]; criteria satisfied by existing code in an additive run still get a task that VERIFIES them):\n${J(CRITERIA)}` : ''
+  const planPrompt = (gapNote) =>
+    `Decompose the build into SMALL, INDEPENDENT, idempotent tasks. EACH task MUST list in files[] the concrete REAL repo-relative paths it will create/modify (at least one) — these are checked against the git diff later, so they must be the actual files. EACH task lists in covers[] the acceptance-criterion ids it satisfies. Prefer NEW files per task; put shared-file edits (barrels/routes/config) in their own dedicated task so they don't collide. Include observability/security/audit/test tasks. Return tasks[].${gapNote}${critList}\n${ADDITIVE ? `THIS IS AN EXISTING CODEBASE — plan ONLY the DELTA the spec requires; do NOT re-plan capabilities that already exist. Name the REAL existing files to create/extend, matching the conventions below.\nREPO CONVENTIONS (ground truth):\n${REPO_AUDIT}\n` : ''}ARCH:\n${arch.artifact}`
+  // COVERAGE MATRIX (script-enforced): a plan that leaves a criterion unclaimed
+  // is rejected and re-planned; still-uncovered criteria become forced
+  // acceptance blockers — silent scope-cuts can't survive the plan stage.
+  for (let pr = 1; pr <= 2; pr++) {
+    const gapNote = UNCOVERED.length ? `\nPREVIOUS PLAN REJECTED — these criteria were covered by NO task; add or extend tasks to cover each: ${J(UNCOVERED)}` : ''
+    const plan = await agent(planPrompt(gapNote), { label: pr === 1 ? 'plan' : `plan:coverage:r${pr}`, phase: 'Plan', schema: PLAN_SCHEMA })
+    tasks = (plan.tasks || []).filter((t) => t && t.id && Array.isArray(t.files) && t.files.length).slice(0, cfg.maxTasks ?? 999)
+    const claimed = new Set(tasks.flatMap((t) => (t.covers || []).map((c) => String(c).toLowerCase())))
+    UNCOVERED = CRITERIA.filter((c) => !claimed.has(String(c.id).toLowerCase())).map((c) => c.id)
+    if (!UNCOVERED.length) break
+    log(`⛔ Plan coverage r${pr}: ${UNCOVERED.length} criteria claimed by NO task: ${UNCOVERED.join(', ')}${pr < 2 ? ' — re-planning' : ' — forcing into acceptance as blockers'}`)
+  }
+  log(`Plan: ${tasks.length} tasks (all with declared files; coverage ${CRITERIA.length - UNCOVERED.length}/${CRITERIA.length} criteria)`)
   await commitStage('plan', `${tasks.length} task contracts`)
 }
 
@@ -366,7 +412,9 @@ function partitionDisjoint(ts) {
 // ── STAGE 5: Build (parallel + deterministic ground-truth gate) ──────────────
 const buildResults = []
 async function buildTask(task) {
-  const prompt = `Implement ONLY task ${task.id} ("${task.title}") in the repo at ${REPO}${ADDITIVE ? ' — an EXISTING codebase: ADD to it following its conventions; do NOT recreate or overwrite what already exists' : ', on top of the scaffold'}, per the architecture. You MUST create/modify the REAL files for this task — returning a description WITHOUT changing files on disk is a FAILURE and a git-diff check will catch it. Embody the principles in YOUR code: structured logging, input validation + per-action authz where relevant, idempotency, no secrets in logs.\nHARD RULES (other agents work in this SAME tree concurrently): touch ONLY this task's files (${(task.files || []).join(', ')}); do NOT edit package.json/lockfiles/shared barrels/config; do NOT run install or git. It's OK if the whole project doesn't typecheck yet.\nCONTRACT: ${task.contract || '(see architecture)'}\n${ADDITIVE ? `REPO CONVENTIONS:\n${REPO_AUDIT}\n` : ''}ARCH:\n${arch.artifact}\nReturn the exact files you wrote/modified (with line counts).`
+  const covered = CRITERIA.filter((c) => (task.covers || []).map((x) => String(x).toLowerCase()).includes(String(c.id).toLowerCase()))
+  const critBlock = covered.length ? `\nACCEPTANCE CRITERIA THIS TASK MUST FULLY SATISFY (verbatim — deferring any of these to a later phase/milestone is a FAILURE):\n${covered.map((c) => `- [${c.id}] ${c.check}`).join('\n')}` : ''
+  const prompt = `Implement ONLY task ${task.id} ("${task.title}") in the repo at ${REPO}${ADDITIVE ? ' — an EXISTING codebase: ADD to it following its conventions; do NOT recreate or overwrite what already exists' : ', on top of the scaffold'}, per the architecture. You MUST create/modify the REAL files for this task — returning a description WITHOUT changing files on disk is a FAILURE and a git-diff check will catch it. Embody the principles in YOUR code: structured logging, input validation + per-action authz where relevant, idempotency, no secrets in logs.${critBlock}\nHARD RULES (other agents work in this SAME tree concurrently): touch ONLY this task's files (${(task.files || []).join(', ')}); do NOT edit package.json/lockfiles/shared barrels/config; do NOT run install or git. It's OK if the whole project doesn't typecheck yet.\nCONTRACT: ${task.contract || '(see architecture)'}\n${ADDITIVE ? `REPO CONVENTIONS:\n${REPO_AUDIT}\n` : ''}ARCH:\n${arch.artifact}\nReturn the exact files you wrote/modified (with line counts).`
   const r = await withRetry(`build:${task.id}`, 'Build', prompt, MAX_RETRY)
   return { id: task.id, title: task.title, ok: r.ok, attempts: r.attempts, summary: r.ok ? r.text : r.reason }
 }
@@ -396,6 +444,20 @@ async function runBuild() {
   const failed = impl.filter((r) => !r.ok)
   buildResults.push(...impl)
   if (failed.length) log(`⚠ ${failed.length}/${impl.length} tasks failed after retries: ${failed.map((f) => f.id).join(', ')} — integration backfills`)
+  // DEFERRAL DETECTION (script-enforced): a build summary that punts scope to a
+  // later phase is the exact failure class that left run wf_c6fc100f with 4
+  // unmet criteria ("admin read side deferred to Phase 2"). Catch it from the
+  // agent's OWN words and force a completion round before integration.
+  const RE_DEFER = /\b(defer(red|ring)?|phase ?2|out of scope|later (milestone|phase|PR)|follow[- ]?up|post[- ]?launch|TODO later)\b/i
+  const deferred = impl.filter((r) => r.ok && RE_DEFER.test(String(r.summary)))
+  if (deferred.length) {
+    DEFERRED_FLAGS = deferred.map((d) => d.id)
+    log(`⛔ Deferral detected in ${deferred.length} task summary(ies): ${DEFERRED_FLAGS.join(', ')} — forcing completion now`)
+    const detail = deferred.map((d) => ({ id: d.id, title: d.title, covers: (tasks.find((t) => t.id === d.id) || {}).covers || [], summary: String(d.summary).slice(0, 300) }))
+    await withRetry('build:undefer', 'Build',
+      `SCOPE-CUT DETECTED in ${REPO}: these tasks reported done but their own summaries defer part of the contract to a later phase — deferral is NOT allowed; the full acceptance criteria are v1 scope. Implement the deferred parts COMPLETELY now (real files, real behavior), then commit+push (wf(build): undefer). Tasks:\n${J(detail)}\nCRITERIA (verbatim):\n${J(CRITERIA.filter((c) => detail.some((d) => d.covers.map((x) => String(x).toLowerCase()).includes(String(c.id).toLowerCase()))))}\nARCH:\n${arch.artifact}`, MAX_RETRY)
+    await commitStage('build-undefer', `completed deferred scope: ${DEFERRED_FLAGS.join(', ')}`)
+  }
   await commitStage('build-parallel', `${impl.length - failed.length}/${impl.length} tasks`)
 
   // Integration: wire + make the whole thing green; backfill failures.
@@ -434,6 +496,42 @@ async function runBuild() {
     await commitStage(`build-ground-truth-r${g}`, 'reimplemented ghost tasks')
   }
   if (!GROUND_TRUTH.clean) log(`⛔ Ground truth NOT clean after ${MAX_GT} rounds — unresolved: ${lastGhosts.join(', ')}. deployReady will be forced false.`)
+
+  // ── REFUTER WAVE (T1): the ground-truth gate proves files LANDED; this wave
+  // adversarially probes whether they actually SATISFY their contracts+criteria.
+  // One refuter per task cluster, default refuted=true; surviving refutations
+  // get ONE fix round, and whatever remains seeds Verify's known-unresolved list.
+  phase('Refute')
+  const RSCHEMA = {
+    type: 'object', additionalProperties: false,
+    properties: { refuted: { type: 'boolean' }, evidence: { type: 'string' } },
+    required: ['refuted', 'evidence'],
+  }
+  const clusters = []
+  for (let i = 0; i < tasks.length; i += 3) clusters.push(tasks.slice(i, i + 3))
+  const refClaim = (cl) => cl.map((t) => {
+    const cov = CRITERIA.filter((c) => (t.covers || []).map((x) => String(x).toLowerCase()).includes(String(c.id).toLowerCase()))
+    return `${t.id} "${t.title}" (files: ${(t.files || []).join(', ')}; contract: ${(t.contract || '').slice(0, 200)}${cov.length ? `; criteria: ${cov.map((c) => `[${c.id}] ${c.check}`).join(' | ').slice(0, 500)}` : ''})`
+  }).join('\n')
+  const verdicts = await parallel(clusters.map((cl, i) => () =>
+    agent(`In ${REPO}, adversarially try to REFUTE this claim by reading the ACTUAL files and running cheap checks (grep/node/typecheck snippets): "Tasks below are FULLY implemented per their contracts and acceptance criteria — complete behavior, not stubs, no silently-missing pieces." Default refuted=true unless you find concrete file:line evidence each one holds. Tasks:\n${refClaim(cl)}`,
+      { label: `refute:cluster${i + 1}`, phase: 'Refute', schema: RSCHEMA })))
+  const standing = verdicts.map((v, i) => ({ v, cl: clusters[i] })).filter((x) => x.v)
+  const refuted = standing.filter((x) => x.v.refuted)
+  if (refuted.length) {
+    log(`⛔ Refute: ${refuted.length}/${standing.length} cluster(s) refuted — one fix round`)
+    await withRetry('refute:fix', 'Refute',
+      `Adversarial review found these implementation gaps in ${REPO} — fix the ROOT CAUSES with real code (never weaken a check), then typecheck/build/lint green and commit+push (wf(refute): fixes).\nFINDINGS:\n${J(refuted.map((x) => ({ tasks: x.cl.map((t) => t.id), evidence: String(x.v.evidence).slice(0, 600) })))}\nARCH:\n${arch.artifact}`, MAX_RETRY)
+    await commitStage('refute-fix', `${refuted.length} refuted cluster(s) remediated`)
+    // re-probe ONLY the fixed clusters once; anything still refuted goes to Verify
+    const recheck = await parallel(refuted.map((x, i) => () =>
+      agent(`In ${REPO}, adversarially RE-CHECK after a fix round — try to REFUTE: "These tasks are now FULLY implemented per contract+criteria." Default refuted=true without file:line evidence. Tasks:\n${refClaim(x.cl)}`,
+        { label: `refute:recheck${i + 1}`, phase: 'Refute', schema: RSCHEMA })))
+    REFUTE_GAPS = recheck.map((v, i) => ({ v, cl: refuted[i].cl })).filter((x) => x.v && x.v.refuted)
+      .map((x) => `Refuter evidence (tasks ${x.cl.map((t) => t.id).join(',')}): ${String(x.v.evidence).slice(0, 400)}`)
+    if (REFUTE_GAPS.length) log(`⛔ Refute: ${REFUTE_GAPS.length} cluster(s) STILL refuted after fix — handing to Verify`)
+    else log(`✓ Refute: all refuted clusters fixed and re-verified`)
+  } else log(`✓ Refute: ${standing.length}/${clusters.length} clusters survived adversarial refutation`)
 }
 if (willRun('build')) await runBuild()
 
@@ -446,18 +544,28 @@ if (willRun('verify')) {
     properties: {
       passed: { type: 'boolean' },
       buildGreen: { type: 'boolean' },
+      evidence: { type: 'string' }, // pasted tail of the typecheck/build/lint output — a bare boolean is fabricatable
       filesPresent: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { id: { type: 'string' }, present: { type: 'boolean' } }, required: ['id', 'present'] } },
       gaps: { type: 'array', items: { type: 'string' } },
     },
-    required: ['passed', 'buildGreen', 'filesPresent', 'gaps'],
+    required: ['passed', 'buildGreen', 'evidence', 'filesPresent', 'gaps'],
   }
-  // Seed gaps with any unresolved ground-truth ghosts so Verify MUST resolve them.
-  const seedGaps = GROUND_TRUTH.clean ? [] : [`Ground-truth ghosts (claimed built, no real file): ${GROUND_TRUTH.ghosts.join(', ')}`]
+  // Seed gaps with any unresolved ground-truth ghosts + surviving refuter
+  // evidence so Verify MUST resolve them.
+  const seedGaps = [
+    ...(GROUND_TRUTH.clean ? [] : [`Ground-truth ghosts (claimed built, no real file): ${GROUND_TRUTH.ghosts.join(', ')}`]),
+    ...REFUTE_GAPS,
+  ]
   for (let r = 1; r <= MAX_ROUNDS; r++) {
     verify = await agent(
-      `Adversarially VERIFY the repo at ${REPO} ON DISK — trust files, not prior claims. (0) For each EXPECTED task, confirm its declared files EXIST with real, non-stub content; return filesPresent[{id,present}]. (1) RUN typecheck+build+lint yourself for the whole project; set buildGreen. (2) Scan EVERY source file for stubs/placeholders/TODOs/empty surfaces — none allowed for planned tasks. (3) Spot-check the principles in the actual code: structured logging present? secrets NOT logged/leaked? idempotency on retryable ops? input validation/authz on entry points? Pass ONLY if every expected file exists, buildGreen, no stubs remain, and these checks hold. List concrete gaps.\nKNOWN UNRESOLVED (must fix): ${J(seedGaps)}\nTasks expected: ${J(tasks.map((t) => ({ id: t.id, title: t.title, files: t.files })))}`,
+      `Adversarially VERIFY the repo at ${REPO} ON DISK — trust files, not prior claims. (0) For each EXPECTED task, confirm its declared files EXIST with real, non-stub content; return filesPresent[{id,present}]. (1) RUN typecheck+build+lint yourself for the whole project; set buildGreen and paste the LAST ~15 lines of real command output into evidence (a verdict without pasted output is rejected by the harness). (2) Scan EVERY source file for stubs/placeholders/TODOs/empty surfaces — none allowed for planned tasks. (3) Spot-check the principles in the actual code: structured logging present? secrets NOT logged/leaked? idempotency on retryable ops? input validation/authz on entry points? Pass ONLY if every expected file exists, buildGreen, no stubs remain, and these checks hold. List concrete gaps.\nKNOWN UNRESOLVED (must fix): ${J(seedGaps)}\nTasks expected: ${J(tasks.map((t) => ({ id: t.id, title: t.title, files: t.files })))}`,
       { label: `verify:r${r}`, phase: 'Verify', schema: VSCHEMA })
     const absent = (verify.filesPresent || []).filter((f) => !f.present).map((f) => f.id)
+    // FABRICATION TRIPWIRE: buildGreen without pasted command output is unproven.
+    if (verify.buildGreen && String(verify.evidence || '').trim().length < 40) {
+      log(`⚠ Verify r${r}: buildGreen claimed with no pasted output — treating as unproven`)
+      verify.buildGreen = false
+    }
     const ok = verify.passed && verify.buildGreen && absent.length === 0
     if (ok) { log(`Verify r${r}: PASS (build green, all files present)`); verify.passed = true; break }
     const gaps = [...(verify.gaps || []), ...(absent.length ? [`Missing files for tasks: ${absent.join(', ')}`] : []), ...(verify.buildGreen ? [] : ['build/typecheck/lint not green'])]
@@ -475,19 +583,35 @@ if (willRun('qa')) {
   phase('QA')
   const QSCHEMA = {
     type: 'object', additionalProperties: false,
-    properties: { passed: { type: 'boolean' }, command: { type: 'string' }, output: { type: 'string' }, surfacesCovered: { type: 'array', items: { type: 'string' } } },
+    properties: { passed: { type: 'boolean' }, command: { type: 'string' }, output: { type: 'string' }, surfacesCovered: { type: 'array', items: { type: 'string' } }, productDefects: { type: 'array', items: { type: 'string' } } },
     required: ['passed', 'command', 'output'],
   }
   const tiers = ['unit', 'integration', 'e2e']
-  const results = []
-  for (const tier of tiers) {
-    const r = await withRetry(`qa:${tier}`, 'QA',
-      `Write and RUN ${tier.toUpperCase()} tests for the product in ${REPO} using its tooling. Cover the acceptance criteria AND failure scenarios (errors/timeouts/retries/bad input/unauthorized). You MUST exercise the NEW surfaces/tasks (${J(tasks.map((t) => t.title))}), not only the pre-existing app. For UI e2e: navigate to each new surface, assert the SUCCESS SURFACE renders real content, and FAIL on any console/page error (a gone-loading-screen is NOT proof). Fix root causes (never weaken assertions) until green. Report the command + a pasted tail of the test output.`, MAX_RETRY)
-    let v = { passed: false }
-    if (r.ok) v = await agent(`Verify the ${tier} tier in ${REPO} is genuinely green and meaningfully exercises the acceptance criteria + a failure scenario + the NEW surfaces. Return passed, the command, a pasted output tail, and surfacesCovered (which new surfaces/tasks the tier exercised). FAIL (passed=false) if it only covers the pre-existing app.`, { label: `qa:${tier}:verify`, phase: 'QA', schema: QSCHEMA })
-    results.push({ tier, passed: !!v.passed, surfacesCovered: v.surfacesCovered || [] })
-    log(`QA:${tier} — ${v.passed ? 'green' : 'NOT green'}`)
+  // PARALLEL TIERS (run wf_c6fc100f spent 61m serial; the two big tiers can run
+  // concurrently). Safety: a SERIAL infra task owns every shared file first;
+  // tier agents then touch ONLY their own test directory and never product
+  // source — product defects funnel into ONE serial fix round after the barrier.
+  await withRetry('qa:test-infra', 'QA',
+    `Configure the TEST INFRASTRUCTURE ONLY in ${REPO}: test runners for unit + integration (and e2e incl. browser tooling if the product has a UI) per the repo's stack, package.json scripts, runner configs, and the per-tier test directory layout — but write NO actual tests. Install what's needed, prove each runner starts cleanly (empty/zero-test suite is fine), then commit+push (wf(qa): test infra). Report runners + commands configured.`, MAX_RETRY)
+  await commitStage('qa-infra', 'test infrastructure (runners/configs/scripts)')
+  const writeTier = (tier) => withRetry(`qa:${tier}`, 'QA',
+    `Write and RUN ${tier.toUpperCase()} tests for the product in ${REPO} using the test infrastructure ALREADY configured (runners/scripts exist — do not reconfigure). Cover the acceptance criteria AND failure scenarios (errors/timeouts/retries/bad input/unauthorized). You MUST exercise the NEW surfaces/tasks (${J(tasks.map((t) => t.title))}), not only the pre-existing app. For UI e2e: navigate to each new surface, assert the SUCCESS SURFACE renders real content, and FAIL on any console/page error (a gone-loading-screen is NOT proof).\nHARD RULES (the other tier agents work in this SAME tree concurrently): create/edit files ONLY inside this tier's own test directory; do NOT touch package.json/lockfiles/runner configs or PRODUCT source. If a test exposes a real product defect, KEEP THE TEST FAILING and report the defect precisely (file, repro, expected vs actual) — a serial fix round handles product code after all tiers land. Report the command + a pasted tail of the test output + defects found.`, MAX_RETRY)
+  const verifyTier = (tier) => agent(
+    `Verify the ${tier} tier in ${REPO} is genuinely green and meaningfully exercises the acceptance criteria + a failure scenario + the NEW surfaces. RUN the tier's command yourself. Return passed, the command, a pasted output tail, surfacesCovered (which new surfaces/tasks the tier exercised), and productDefects (precise product-code defects this tier exposed; [] if none). FAIL (passed=false) if the suite is red or it only covers the pre-existing app.`,
+    { label: `qa:${tier}:verify`, phase: 'QA', schema: QSCHEMA })
+  await parallel(tiers.map((t) => () => writeTier(t)))
+  let checks = (await parallel(tiers.map((t) => () => verifyTier(t).then((v) => ({ tier: t, v }))))).filter(Boolean)
+  const failing = checks.filter((c) => !c.v || !c.v.passed || (c.v.productDefects || []).length)
+  if (failing.length) {
+    log(`QA barrier: ${failing.length} tier(s) red or exposing product defects — one serial fix round`)
+    await withRetry('qa:product-fix', 'QA',
+      `QA exposed product defects / red tiers in ${REPO}. Fix the PRODUCT root causes (NEVER weaken or delete a test), then re-run EACH failing tier's command until green and commit+push (wf(qa): product fixes).\nFAILING:\n${J(failing.map((f) => ({ tier: f.tier, defects: (f.v && f.v.productDefects) || [], output: f.v ? String(f.v.output).slice(0, 400) : 'no verdict' })))}`, MAX_RETRY)
+    await commitStage('qa-product-fix', 'product defects exposed by QA')
+    const recheck = (await parallel(failing.map((f) => () => verifyTier(f.tier).then((v) => ({ tier: f.tier, v }))))).filter(Boolean)
+    checks = checks.map((c) => recheck.find((r) => r.tier === c.tier) || c)
   }
+  const results = checks.map((c) => ({ tier: c.tier, passed: !!(c.v && c.v.passed), surfacesCovered: (c.v && c.v.surfacesCovered) || [] }))
+  for (const r of results) log(`QA:${r.tier} — ${r.passed ? 'green' : 'NOT green'}`)
   qa = { tiers: results, passed: results.every((t) => t.passed) }
   await commitStage('qa', `tiers green=${qa.passed}`)
 }
@@ -507,18 +631,24 @@ if (willRun('acceptance')) {
     required: ['deployReady', 'blockers'],
   }
   acceptance = await agent(
-    `You are the INDEPENDENT release gate. Be adversarial — inspect ${REPO} directly and RUN the build/tests. For each acceptance criterion decide met/not-met with evidence (map each to a real file/test). Score each of the 14 architecture principles met/not-met with a note. Declare deployReady true ONLY if every criterion is met, the build is green, all QA tiers pass, AND the build ground-truth is clean. HARD RULE: if groundTruth.clean is false or verify.passed is false, deployReady MUST be false and list those as blockers.\nSPEC:\n${intake.text}\ngroundTruth: ${J(GROUND_TRUTH)}\nverify.passed: ${J(!!verify.passed)}\nQA: ${J(qa)}\n${PRINCIPLES}`,
+    `You are the INDEPENDENT release gate. Be adversarial — inspect ${REPO} directly and RUN the build/tests. For EACH criterion in the structured CONTRACT below (use its exact ids) decide met/not-met with evidence (map each to a real file/test). Score each of the 14 architecture principles met/not-met with a note. Declare deployReady true ONLY if every criterion is met, the build is green, all QA tiers pass, AND the build ground-truth is clean. HARD RULE: if groundTruth.clean is false or verify.passed is false, deployReady MUST be false and list those as blockers.\nCONTRACT (criteria ids + checks):\n${J(CRITERIA)}\nSPEC:\n${intake.text}\ngroundTruth: ${J(GROUND_TRUTH)}\nverify.passed: ${J(!!verify.passed)}\nQA: ${J(qa)}\n${PRINCIPLES}`,
     { label: 'acceptance:gate', phase: 'Acceptance', schema: ASCHEMA })
   // Belt-and-suspenders: the script enforces the hard invariants regardless of the agent.
   const forcedBlockers = []
   if (!GROUND_TRUTH.clean) forcedBlockers.push(`Ground-truth ghosts unresolved: ${GROUND_TRUTH.ghosts.join(', ')}`)
   if (willRun('verify') && !verify.passed) forcedBlockers.push('Verify did not pass')
   if (willRun('qa') && !qa.passed) forcedBlockers.push('QA tiers not all green')
+  if (UNCOVERED.length) forcedBlockers.push(`Spec-contract: criteria never covered by any plan task: ${UNCOVERED.join(', ')}`)
+  if (REFUTE_GAPS.length && (!willRun('verify') || !verify.passed)) forcedBlockers.push(`Refuter findings unresolved: ${REFUTE_GAPS.length}`)
+  // SPEC-CONTRACT completeness: the gate must have judged every contract id.
+  const judged = new Set((acceptance.criteria || []).map((c) => String(c.id).toLowerCase()))
+  const unjudged = CRITERIA.filter((c) => !judged.has(String(c.id).toLowerCase())).map((c) => c.id)
+  if (unjudged.length) forcedBlockers.push(`Acceptance gate skipped contract criteria: ${unjudged.join(', ')}`)
   if (forcedBlockers.length) { acceptance.deployReady = false; acceptance.blockers = [...new Set([...(acceptance.blockers || []), ...forcedBlockers])] }
   log(`Acceptance: deployReady=${acceptance.deployReady}, blockers=${(acceptance.blockers || []).length}`)
 }
 
-// ── STAGE 9: Manifest (Observability + Auditability: a committed run report) ─
+// ── STAGE 9: Manifest + Lessons (Observability + Auditability + Learning) ────
 if (willRun('manifest')) {
   phase('Manifest')
   const deployReady = acceptance ? (!!acceptance.deployReady && GROUND_TRUTH.clean && (!willRun('verify') || verify.passed)) : null
@@ -526,15 +656,23 @@ if (willRun('manifest')) {
     repo: REPO,
     additive: ADDITIVE,
     stagesRun: ORDER.filter(willRun),
+    specContract: { criteria: CRITERIA.length, uncovered: UNCOVERED, deferralFlags: DEFERRED_FLAGS },
     groundTruth: GROUND_TRUTH,
+    refuteGapsRemaining: REFUTE_GAPS.length,
     build: buildResults.map((r) => ({ id: r.id, ok: r.ok, attempts: r.attempts })),
     verify: { passed: !!verify.passed },
     qa,
     acceptance,
     deployReady,
   }
+  // LESSONS (Learning): convert this run's own failures into durable knowledge —
+  // what broke, the root cause, and concrete harness-patch suggestions. The run
+  // that only ships code learns nothing; the file is the compounding asset.
   await agent(
-    `Write a run report to ${REPO}/docs/RUN-REPORT.md (Markdown) capturing this build: additive vs greenfield, stages run, the ground-truth verdict (clean + any ghost task ids), per-task build status + retry counts, QA tier results, acceptance criteria results, the 14-principle scorecard, final deployReady, and any blockers. Then commit+push (wf(manifest): run report). Create/modify ONLY that file.\nMANIFEST DATA:\n${J(manifest)}`,
+    `Write ${REPO}/docs/LESSONS.md (Markdown; OVERWRITE-SAFE: append a dated section if the file exists). From the run evidence below, document: (1) every failure/retry/ghost/refuted-claim/deferral with its ROOT CAUSE (read the repo/git history where needed); (2) what the harness caught vs what slipped to a later gate; (3) CONCRETE suggestions — for the BRIEF (what a better brief would have specified), for the WORKFLOW (gate/prompt changes, as patch-ready descriptions), and for the PRODUCT (follow-up work). No platitudes — every lesson must name evidence. Then commit+push (wf(manifest): lessons). Create/modify ONLY that file.\nRUN EVIDENCE:\n${J(manifest)}`,
+    { label: 'manifest:lessons', phase: 'Manifest' })
+  await agent(
+    `Write a run report to ${REPO}/docs/RUN-REPORT.md (Markdown) capturing this build: additive vs greenfield, stages run, the spec-contract coverage (criteria count, uncovered ids, deferral flags), the ground-truth verdict (clean + any ghost task ids), refuter-wave outcome, per-task build status + retry counts, QA tier results, acceptance criteria results, the 14-principle scorecard, final deployReady, and any blockers. Then commit+push (wf(manifest): run report). Create/modify ONLY that file.\nMANIFEST DATA:\n${J(manifest)}`,
     { label: 'manifest:report', phase: 'Manifest' })
   return manifest
 }
