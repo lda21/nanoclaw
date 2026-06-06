@@ -101,7 +101,13 @@ export async function dispatch(req: RequestFrame, ctx: CallerContext): Promise<R
     }
   }
 
-  if (ctx.caller !== 'host' && cmd.access === 'approval') {
+  // 'trusted' commands skip the approval roundtrip ONLY for owner-tier
+  // (cli_scope 'global') agents — e.g. the owner's DM PA provisioning an
+  // agent the owner just asked for in that same chat. Everyone else gets
+  // the normal approval flow.
+  const callerScope = ctx.caller === 'agent' ? (getContainerConfig(ctx.agentGroupId)?.cli_scope ?? 'group') : 'global';
+  const needsApproval = cmd.access === 'approval' || (cmd.access === 'trusted' && callerScope !== 'global');
+  if (ctx.caller !== 'host' && needsApproval) {
     const session = getSession(ctx.sessionId);
     if (!session) {
       return err(req.id, 'handler-error', 'Session not found.');

@@ -150,7 +150,7 @@ registerResource({
       },
     },
     provision: {
-      access: 'approval',
+      access: 'trusted',
       description:
         'Atomically provision a NEW agent for a chat: agent group + starter persona + assistant_name + ' +
         'always-on wiring + channel destination, in one call. Use --messaging-group-id <mg-id> ' +

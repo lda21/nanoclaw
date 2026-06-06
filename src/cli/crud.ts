@@ -16,7 +16,10 @@ import type { CallerContext } from './frame.js';
 // Types
 // ---------------------------------------------------------------------------
 
-export type Access = 'open' | 'approval' | 'hidden';
+/** 'trusted' = approval-gated UNLESS the calling agent has cli_scope 'global'
+ *  (the owner-tier PA): consent already happened in the owner's DM, so the
+ *  second "approve ncl ..." prompt is pure friction for that caller. */
+export type Access = 'open' | 'approval' | 'trusted' | 'hidden';
 
 export interface ColumnDef {
   name: string;
