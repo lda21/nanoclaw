@@ -82,6 +82,23 @@ describe('provisionAgent', () => {
     expect(persona).toContain('Where to reply');
     expect(persona).toContain(`to="${dest!.local_name}"`);
     expect(r.personaCreated).toBe(true);
+
+    // kickoff: session pre-created, intro instruction queued, container woken
+    const { wakeContainer } = await import('./container-runner.js');
+    expect(r.sessionId).toBeTruthy();
+    expect(vi.mocked(wakeContainer)).toHaveBeenCalled();
+    const Database = (await import('better-sqlite3')).default;
+    const inbound = new Database(
+      path.join(TEST_DIR, 'data', 'v2-sessions', r.agentGroupId, r.sessionId, 'inbound.db'),
+    );
+    const row = inbound
+      .prepare("SELECT content FROM messages_in WHERE id LIKE 'provision-%'")
+      .get() as { content: string } | undefined;
+    inbound.close();
+    expect(row).toBeTruthy();
+    const intro = (JSON.parse(row!.content) as { text: string }).text;
+    expect(intro).toContain('introduce yourself');
+    expect(intro).toContain(`to="${dest!.local_name}"`);
   });
 
   it('refuses a chat that already has a wired agent (no duplicates)', async () => {

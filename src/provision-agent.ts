@@ -27,6 +27,8 @@ import { createAgentGroup, getAgentGroupByFolder } from './db/agent-groups.js';
 import { getMessagingGroup, createMessagingGroupAgent, getMessagingGroupAgents } from './db/messaging-groups.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from './db/container-configs.js';
 import { createDestination, getDestinationByTarget } from './modules/agent-to-agent/db/agent-destinations.js';
+import { resolveSession, writeSessionMessage } from './session-manager.js';
+import { wakeContainer } from './container-runner.js';
 import { GROUPS_DIR } from './config.js';
 import { log } from './log.js';
 
@@ -44,6 +46,8 @@ export interface ProvisionResult {
   folder: string;
   wiringId: string;
   personaCreated: boolean;
+  /** Pre-created session — the agent is woken into it to greet the chat. */
+  sessionId: string;
 }
 
 function slugify(name: string): string {
@@ -54,12 +58,7 @@ function slugify(name: string): string {
   return slug || 'agent';
 }
 
-function starterPersona(
-  name: string,
-  purpose: string | undefined,
-  chatName: string,
-  chatDest: string,
-): string {
+function starterPersona(name: string, purpose: string | undefined, chatName: string, chatDest: string): string {
   return `# ${name}
 
 You are ${name}, a NanoClaw agent dedicated to the "${chatName}" chat.
@@ -153,6 +152,31 @@ export function provisionAgent(args: ProvisionArgs): ProvisionResult {
     personaCreated = true;
   }
 
-  log.info('Agent provisioned', { agentGroupId, name, folder, messagingGroupId: mg.id, wiringId, chatDest });
-  return { agentGroupId, folder, wiringId, personaCreated };
+  // 6. Kickoff: pre-create the session and wake the agent with an
+  //    introduce-yourself instruction — the chat hears from its new agent
+  //    immediately instead of the agent lurking until someone messages first.
+  const { session } = resolveSession(agentGroupId, mg.id, null, 'shared');
+  writeSessionMessage(agentGroupId, session.id, {
+    id: `provision-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    kind: 'chat',
+    timestamp: now,
+    platformId: 'system',
+    channelType: 'agent',
+    threadId: null,
+    content: JSON.stringify({
+      text:
+        `You were just provisioned as the agent for the "${mg.name ?? mg.platform_id}" chat. ` +
+        `Read your CLAUDE.local.md (your persona and purpose), then introduce yourself in the chat NOW ` +
+        `using <message to="${chatDest}">: who you are, your purpose in one line, and one question to get started. Keep it short and warm.`,
+      sender: 'system',
+      senderId: 'system',
+    }),
+    trigger: 1,
+  });
+  void wakeContainer(session).catch((err) =>
+    log.warn('Provision kickoff wake failed — host-sweep will retry', { sessionId: session.id, err: String(err) }),
+  );
+
+  log.info('Agent provisioned', { agentGroupId, name, folder, messagingGroupId: mg.id, wiringId, chatDest, sessionId: session.id });
+  return { agentGroupId, folder, wiringId, personaCreated, sessionId: session.id };
 }
