@@ -170,6 +170,8 @@ function collectSnapshot(): Record<string, unknown> {
     uptime: Math.floor(process.uptime()),
     host_version: readHostVersion(),
     shared_skills: collectSharedSkills(),
+    // Built-in MCP tools, parsed from the agent-runner source (cached).
+    agent_tools: collectAgentTools(),
     agent_groups: collectAgentGroups(),
     sessions: collectSessions(),
     channels: collectChannels(),
@@ -252,12 +254,14 @@ function collectBrain(
   folder: string,
   sharedMd: string | null,
   skillCatalog: Array<{ name: string; description: string | null }>,
+  groupId?: string,
 ): {
   claude_md: string | null;
   claude_local_md: string | null;
   shared_md: string | null;
   fragments: string[];
   skills: Array<{ name: string; description: string | null }>;
+  commands: Array<{ name: string; description: string | null }>;
 } | null {
   const dir = path.join(GROUPS_DIR, folder);
   const readCapped = (file: string): string | null => {
@@ -289,16 +293,128 @@ function collectBrain(
         const name = f.replace(/^skill-/, '').replace(/\.md$/, '');
         return { name, description: skillCatalog.find((s) => s.name === name)?.description ?? null };
       });
+    // Slash commands the agent ACTUALLY has at runtime — the skills installed
+    // in its mounted Claude home (data/v2-sessions/<groupId>/.claude-shared/
+    // skills/). This is the ground truth the agent itself reports when asked
+    // "what commands do you support" (plus Claude Code's own bundled ones,
+    // which ship inside the container image and aren't host-enumerable).
+    const commands = groupId ? collectAgentCommands(groupId, skillCatalog) : [];
     return {
       claude_md: readCapped('CLAUDE.md'),
       claude_local_md: readCapped('CLAUDE.local.md'),
       shared_md: sharedMd,
       fragments,
       skills,
+      commands,
     };
   } catch {
     return null;
   }
+}
+
+/** Skill-frontmatter description reader shared by the runtime-skills scan. */
+function readSkillDescription(skillMdPath: string): string | null {
+  try {
+    const head = fs.readFileSync(skillMdPath, 'utf-8').slice(0, 2048);
+    const m = /^description:[ \t]*(.*)$/m.exec(head);
+    if (!m) return null;
+    const inline = m[1].trim();
+    if (inline && !/^[>|][+-]?$/.test(inline)) return inline;
+    const after = head
+      .slice(m.index + m[0].length)
+      .split('\n')
+      .slice(1);
+    const block: string[] = [];
+    for (const line of after) {
+      if (/^\s+\S/.test(line)) block.push(line.trim());
+      else break;
+    }
+    return block.join(' ') || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Runtime skill/command list for one agent group, read from the agent's
+ * mounted Claude home: data/v2-sessions/<groupId>/.claude-shared/skills/.
+ * Falls back to the shared catalog for descriptions when the skill dir has
+ * no SKILL.md frontmatter of its own. Best-effort — [] on any error.
+ */
+function collectAgentCommands(
+  groupId: string,
+  skillCatalog: Array<{ name: string; description: string | null }>,
+): Array<{ name: string; description: string | null }> {
+  try {
+    const skillsDir = path.join(DATA_DIR, 'v2-sessions', groupId, '.claude-shared', 'skills');
+    return (
+      fs
+        .readdirSync(skillsDir, { withFileTypes: true })
+        // Shared skills are SYMLINKS to the container-internal path
+        // (/app/skills/<name>) — dangling on the host, so isDirectory() is
+        // false; accept them by name. Agent-installed skills are real dirs.
+        .filter((e) => e.isDirectory() || e.isSymbolicLink())
+        .map((e) => ({
+          name: e.name,
+          description:
+            readSkillDescription(path.join(skillsDir, e.name, 'SKILL.md')) ??
+            // Symlinked shared skill → its content lives in the host repo.
+            readSkillDescription(path.join(process.cwd(), 'container', 'skills', e.name, 'SKILL.md')) ??
+            skillCatalog.find((s) => s.name === e.name)?.description ??
+            null,
+        }))
+        .sort((a, b) => a.name.localeCompare(b.name))
+    );
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Built-in MCP tools, enumerated DYNAMICALLY from the agent-runner source
+ * (container/agent-runner/src/mcp-tools/<module>.ts) — the literal
+ * `tool: { name, description }` definitions the in-container MCP server
+ * advertises. Parsed once per process (the source only changes with a host
+ * deploy). This keeps the dashboard truthful instead of hand-maintaining a
+ * catalog that drifts.
+ */
+let agentToolsCache: Array<{
+  module: string;
+  tools: Array<{ name: string; description: string | null }>;
+}> | null = null;
+function collectAgentTools(): Array<{
+  module: string;
+  tools: Array<{ name: string; description: string | null }>;
+}> {
+  if (agentToolsCache) return agentToolsCache;
+  const out: Array<{ module: string; tools: Array<{ name: string; description: string | null }> }> = [];
+  try {
+    const dir = path.join(process.cwd(), 'container', 'agent-runner', 'src', 'mcp-tools');
+    const moduleFiles = fs
+      .readdirSync(dir)
+      .filter((f) => f.endsWith('.ts') && !f.endsWith('.test.ts') && !['index.ts', 'server.ts', 'types.ts'].includes(f))
+      .sort();
+    for (const file of moduleFiles) {
+      const src = fs.readFileSync(path.join(dir, file), 'utf-8');
+      const tools: Array<{ name: string; description: string | null }> = [];
+      // Each tool literal: name: '<snake_case>' followed (within the same
+      // object) by description: '...'. Tool names are snake_case — this
+      // skips the MCP server name and other identifiers.
+      const re = /name:\s*'([a-z][a-z0-9_]*)'\s*,\s*description:\s*('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|`(?:[^`\\]|\\.)*`)/g;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(src)) !== null) {
+        const raw = m[2].slice(1, -1).replace(/\\(['"`n])/g, (_, c: string) => (c === 'n' ? ' ' : c));
+        // First sentence is enough for the dashboard list.
+        const firstSentence = raw.split(/(?<=\.)\s/)[0] ?? raw;
+        tools.push({ name: m[1], description: firstSentence.slice(0, 200) || null });
+      }
+      if (tools.length > 0) out.push({ module: file.replace(/\.ts$/, ''), tools });
+    }
+  } catch {
+    /* missing tree (slimmed install) — empty list, app falls back */
+  }
+  agentToolsCache = out;
+  return out;
 }
 
 /**
@@ -408,7 +524,7 @@ function collectAgentGroups() {
       folder: g.folder,
       agent_provider: g.agent_provider,
       container_config: getContainerConfig(g.id) ?? null,
-      brain: collectBrain(g.folder, sharedMd, skillCatalog),
+      brain: collectBrain(g.folder, sharedMd, skillCatalog, g.id),
       sessionCount: sessions.length,
       runningSessions: running.length,
       wirings,
@@ -787,6 +903,26 @@ function collectMessages() {
 
   const results: Array<{ agentGroupId: string; sessionId: string; inbound: unknown[]; outbound: unknown[] }> = [];
   const limit = 50;
+  // PER-CATEGORY caps: chat (human conversation) and internal plumbing (task
+  // frames, system/cli rows) each get their own newest-N window. A recurring
+  // per-minute task otherwise floods the single window and pushes every real
+  // chat message out — "Nano's messages are not working". Categorized by
+  // `kind`: scheduler writes 'task', host writes 'system'/cli kinds; chat is
+  // everything else ('chat', 'chat-sdk', channel-specific kinds).
+  const INTERNAL_KINDS = "('task','system')";
+  const internalWhere = `(kind IN ${INTERNAL_KINDS} OR kind LIKE 'cli%')`;
+  /** Newest `limit` rows of each category, merged back to chronological order. */
+  const readSplit = (db: InstanceType<typeof Database>, table: string): unknown[] => {
+    const chat = db
+      .prepare(`SELECT * FROM ${table} WHERE NOT ${internalWhere} ORDER BY seq DESC LIMIT ?`)
+      .all(limit);
+    const internal = db
+      .prepare(`SELECT * FROM ${table} WHERE ${internalWhere} ORDER BY seq DESC LIMIT ?`)
+      .all(limit);
+    return [...(chat as Array<{ seq: number }>), ...(internal as Array<{ seq: number }>)].sort(
+      (a, b) => a.seq - b.seq,
+    );
+  };
 
   try {
     // ALL agent-group dirs — ids are 'ag-<ts>-<rand>' for host-created groups
@@ -805,8 +941,7 @@ function collectMessages() {
         if (fs.existsSync(inDbPath)) {
           try {
             const db = new Database(inDbPath, { readonly: true });
-            const rows = db.prepare('SELECT * FROM messages_in ORDER BY seq DESC LIMIT ?').all(limit);
-            inbound.push(...(rows as unknown[]).reverse());
+            inbound.push(...readSplit(db, 'messages_in'));
             db.close();
           } catch {
             /* skip */
@@ -817,8 +952,7 @@ function collectMessages() {
         if (fs.existsSync(outDbPath)) {
           try {
             const db = new Database(outDbPath, { readonly: true });
-            const rows = db.prepare('SELECT * FROM messages_out ORDER BY seq DESC LIMIT ?').all(limit);
-            outbound.push(...(rows as unknown[]).reverse());
+            outbound.push(...readSplit(db, 'messages_out'));
             db.close();
           } catch {
             /* skip */
