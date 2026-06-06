@@ -820,7 +820,14 @@ function collectContextWindows() {
           results.push({
             agentGroupId: agDir,
             agentGroupName: nameMap.get(agDir),
-            sessionId: path.basename(jsonlFiles[0], '.jsonl'),
+            // The NANOCLAW session id — the app joins context windows to
+            // sessions by this (the jsonl basename is the Claude SDK session
+            // UUID, which matches nothing). .claude-shared is per agent
+            // group, so attribute the window to the group's live session.
+            sessionId:
+              getSessionsByAgentGroup(agDir).find((s) => s.status === 'active')?.id ??
+              path.basename(jsonlFiles[0], '.jsonl'),
+            claude_session_id: path.basename(jsonlFiles[0], '.jsonl'),
             model,
             contextTokens: ctx,
             outputTokens: u.output_tokens || 0,
