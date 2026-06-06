@@ -32,6 +32,7 @@ import { log } from './log.js';
 import { resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
 import { wakeContainer } from './container-runner.js';
 import { getSession } from './db/sessions.js';
+import { addMember } from './modules/permissions/db/agent-group-members.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent } from './types.js';
 import type { InboundEvent } from './channels/adapter.js';
 
@@ -444,6 +445,24 @@ async function deliverToAgent(
       });
       log.info('Admin command denied by gate', { command: gate.command, userId, agentGroupId: agent.agent_group_id });
       return;
+    }
+  }
+
+  // Membership-by-engagement: a REGISTERED human whose message is accepted
+  // and routed to this agent de-facto has access — record it so the roster
+  // (Users → Groups) reflects reality. INSERT OR IGNORE; grants nothing new
+  // (the wiring already lets them through), and agent/system senders never
+  // have a userId here.
+  if (userId && event.channelType !== 'agent') {
+    try {
+      addMember({
+        user_id: userId,
+        agent_group_id: agent.agent_group_id,
+        added_by: 'router:engagement',
+        added_at: new Date().toISOString(),
+      });
+    } catch {
+      /* roster bookkeeping must never block routing */
     }
   }
 
