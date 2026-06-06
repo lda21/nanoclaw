@@ -172,6 +172,9 @@ function collectSnapshot(): Record<string, unknown> {
     shared_skills: collectSharedSkills(),
     // Built-in MCP tools, parsed from the agent-runner source (cached).
     agent_tools: collectAgentTools(),
+    // Global shared memory (container/CLAUDE.md) — system-level, shown on the
+    // System screen (the per-agent Brain shows only the agent's own delta).
+    shared_md: readSharedMd(),
     agent_groups: collectAgentGroups(),
     sessions: collectSessions(),
     channels: collectChannels(),
@@ -400,7 +403,8 @@ function collectAgentTools(): Array<{
       // Each tool literal: name: '<snake_case>' followed (within the same
       // object) by description: '...'. Tool names are snake_case — this
       // skips the MCP server name and other identifiers.
-      const re = /name:\s*'([a-z][a-z0-9_]*)'\s*,\s*description:\s*('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|`(?:[^`\\]|\\.)*`)/g;
+      const re =
+        /name:\s*'([a-z][a-z0-9_]*)'\s*,\s*description:\s*('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"|`(?:[^`\\]|\\.)*`)/g;
       let m: RegExpExecArray | null;
       while ((m = re.exec(src)) !== null) {
         const raw = m[2].slice(1, -1).replace(/\\(['"`n])/g, (_, c: string) => (c === 'n' ? ' ' : c));
@@ -913,15 +917,9 @@ function collectMessages() {
   const internalWhere = `(kind IN ${INTERNAL_KINDS} OR kind LIKE 'cli%')`;
   /** Newest `limit` rows of each category, merged back to chronological order. */
   const readSplit = (db: InstanceType<typeof Database>, table: string): unknown[] => {
-    const chat = db
-      .prepare(`SELECT * FROM ${table} WHERE NOT ${internalWhere} ORDER BY seq DESC LIMIT ?`)
-      .all(limit);
-    const internal = db
-      .prepare(`SELECT * FROM ${table} WHERE ${internalWhere} ORDER BY seq DESC LIMIT ?`)
-      .all(limit);
-    return [...(chat as Array<{ seq: number }>), ...(internal as Array<{ seq: number }>)].sort(
-      (a, b) => a.seq - b.seq,
-    );
+    const chat = db.prepare(`SELECT * FROM ${table} WHERE NOT ${internalWhere} ORDER BY seq DESC LIMIT ?`).all(limit);
+    const internal = db.prepare(`SELECT * FROM ${table} WHERE ${internalWhere} ORDER BY seq DESC LIMIT ?`).all(limit);
+    return [...(chat as Array<{ seq: number }>), ...(internal as Array<{ seq: number }>)].sort((a, b) => a.seq - b.seq);
   };
 
   try {
