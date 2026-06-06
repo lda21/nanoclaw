@@ -133,9 +133,7 @@ async function main(): Promise<void> {
         // agent for it. No-op for known groups (the common path).
         if (isGroup) {
           void import('./group-onboarding.js')
-            .then(({ handleDiscoveredGroup }) =>
-              handleDiscoveredGroup(adapter.channelType, platformId, name),
-            )
+            .then(({ handleDiscoveredGroup }) => handleDiscoveredGroup(adapter.channelType, platformId, name))
             .catch((err) => log.warn('Group onboarding hook failed', { err: String(err) }));
         }
       },
@@ -246,6 +244,11 @@ async function main(): Promise<void> {
       onGroupFileRead: async (groupId: string, relPath: string) => {
         const { readGroupFile } = await import('./group-files.js');
         return readGroupFile(groupId, relPath);
+      },
+      // Message attachments (inbox/) for the app's inline image rendering.
+      onSessionFileRead: async (agentGroupId: string, sessionId: string, relPath: string) => {
+        const { readSessionFile } = await import('./group-files.js');
+        return readSessionFile(agentGroupId, sessionId, relPath);
       },
     });
     startDashboardPusher({ port: dashboardPort, secret: dashboardSecret, intervalMs: 60000 });

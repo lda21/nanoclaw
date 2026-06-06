@@ -473,6 +473,9 @@ registerChannelAdapter('whatsapp', {
         { key: 'videoMessage', type: 'video', ext: '.mp4' },
         { key: 'audioMessage', type: 'audio', ext: '.ogg' },
         { key: 'documentMessage', type: 'document', ext: '' },
+        // Stickers are webp images — without this entry they had no text AND
+        // no attachment, so the empty-message skip swallowed them entirely.
+        { key: 'stickerMessage', type: 'sticker', ext: '.webp' },
       ];
       const results: Array<{ type: string; name: string; mimeType?: string; size: number; data: string }> = [];
       for (const { key, type, ext } of mediaTypes) {

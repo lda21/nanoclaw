@@ -14,7 +14,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { getAgentGroup } from './db/agent-groups.js';
-import { GROUPS_DIR } from './config.js';
+import { DATA_DIR, GROUPS_DIR } from './config.js';
 
 const FILE_CAP = 64 * 1024;
 /** Media (image/audio) is served base64 up to this cap — voice notes and
@@ -61,6 +61,11 @@ export async function readGroupFile(groupId: string, relPath: string): Promise<G
   if (!group) return { ok: false, error: 'unknown agent group' };
 
   const root = fs.realpathSync(path.resolve(GROUPS_DIR, group.folder));
+  return readFromRoot(root, relPath);
+}
+
+/** Shared core: path-confined read under an already-realpathed root. */
+async function readFromRoot(root: string, relPath: string): Promise<GroupFileResult> {
   // Normalize + resolve INSIDE the root; reject anything that escapes it
   // (covers '..', absolute paths, and symlinks pointing outside).
   const target = path.resolve(root, relPath);
@@ -131,4 +136,27 @@ export async function readGroupFile(groupId: string, relPath: string): Promise<G
     content: truncated ? text.slice(0, FILE_CAP) : text,
     truncated,
   };
+}
+
+
+/**
+ * Read a file from a SESSION directory — used to serve message attachments
+ * (the app's inline image rendering). Restricted to the inbox/ subtree, which
+ * is where extractAttachmentFiles lands inbound media. Same path-safety and
+ * media/text policy as the group reader.
+ */
+export async function readSessionFile(
+  agentGroupId: string,
+  sessionId: string,
+  relPath: string,
+): Promise<GroupFileResult> {
+  if (!/^[A-Za-z0-9_-]+$/.test(agentGroupId) || !/^[A-Za-z0-9_-]+$/.test(sessionId)) {
+    return { ok: false, error: 'invalid ids' };
+  }
+  if (!relPath.startsWith('inbox/')) {
+    return { ok: false, error: 'only inbox/ attachments are readable' };
+  }
+  const dir = path.join(DATA_DIR, 'v2-sessions', agentGroupId, sessionId);
+  if (!fs.existsSync(dir)) return { ok: false, error: 'unknown session' };
+  return readFromRoot(fs.realpathSync(dir), relPath);
 }
