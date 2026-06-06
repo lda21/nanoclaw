@@ -5,11 +5,7 @@
  * to instantiate and set up all registered adapters.
  */
 import type { ChannelAdapter, ChannelRegistration, ChannelSetup } from './adapter.js';
-import {
-  createMessagingGroup,
-  getMessagingGroupByPlatform,
-  updateMessagingGroup,
-} from '../db/messaging-groups.js';
+import { createMessagingGroup, getMessagingGroupByPlatform, updateMessagingGroup } from '../db/messaging-groups.js';
 import { log } from '../log.js';
 
 const SETUP_RETRY_DELAYS_MS = [2000, 5000, 10000];
@@ -128,8 +124,9 @@ export async function syncChannelConversations(
     if (!conv.platformId) continue;
     const existing = getMessagingGroupByPlatform(channelType, conv.platformId);
     if (!existing) {
+      const mgId = `mg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       createMessagingGroup({
-        id: `mg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        id: mgId,
         channel_type: channelType,
         platform_id: conv.platformId,
         name: conv.name || null,
@@ -139,6 +136,15 @@ export async function syncChannelConversations(
         created_at: new Date().toISOString(),
       });
       registered++;
+      // Chat-first onboarding: a NEW group registered via sync gets the same
+      // "want an agent for it?" offer as metadata-path discovery (dynamic
+      // import — onboarding pulls in container/session modules this registry
+      // must not load eagerly).
+      if (conv.isGroup) {
+        void import('../group-onboarding.js')
+          .then(({ offerAgentForGroup }) => offerAgentForGroup(mgId, channelType, conv.name || null, conv.platformId))
+          .catch((err) => log.warn('Group onboarding offer failed', { mgId, err: String(err) }));
+      }
     } else if (conv.name && conv.name !== existing.name) {
       updateMessagingGroup(existing.id, { name: conv.name });
       updated++;

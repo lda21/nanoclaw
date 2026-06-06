@@ -44,15 +44,7 @@ export function handleDiscoveredGroup(channelType: string, platformId: string, n
       created_at: new Date().toISOString(),
     } as Parameters<typeof createMessagingGroup>[0]);
     log.info('New group auto-registered (unwired)', { channelType, platformId, name: name ?? null, mgId });
-
-    notifyOwnerDmAgent(
-      `📥 New ${channelType} group detected: "${name ?? platformId}" (messaging group ${mgId}). ` +
-        `I was added to it but no agent is wired. DM the owner: ask whether they want a dedicated agent for this group, ` +
-        `and if yes ask for a one-line purpose, then run: ` +
-        `ncl groups provision --messaging-group-id ${mgId} --name "<AgentName>" --purpose "<one line>". ` +
-        `The new agent will greet the group automatically on its first message. If the owner declines, do nothing — ` +
-        `the group stays registered but inert.`,
-    );
+    offerAgentForGroup(mgId, channelType, name ?? null, platformId);
   } catch (err) {
     // Unique-constraint race (two metadata events) or notify failure — never
     // let onboarding break the adapter's event path.
@@ -60,6 +52,28 @@ export function handleDiscoveredGroup(channelType: string, platformId: string, n
   } finally {
     inFlight.delete(key);
   }
+}
+
+/**
+ * Ask the owner's DM agent to offer onboarding for a freshly-registered group.
+ * Called from BOTH discovery paths: the metadata hook above AND
+ * syncChannelConversations (app "Sync groups" / admin sync) — whichever
+ * registers the group first owns the offer.
+ */
+export function offerAgentForGroup(
+  mgId: string,
+  channelType: string,
+  name: string | null,
+  platformId: string,
+): void {
+  notifyOwnerDmAgent(
+    `📥 New ${channelType} group detected: "${name ?? platformId}" (messaging group ${mgId}). ` +
+      `I was added to it but no agent is wired. DM the owner: ask whether they want a dedicated agent for this group, ` +
+      `and if yes ask for a one-line purpose, then run: ` +
+      `ncl groups provision --messaging-group-id ${mgId} --name "<AgentName>" --purpose "<one line>". ` +
+      `The new agent will greet the group automatically on its first message. If the owner declines, do nothing — ` +
+      `the group stays registered but inert.`,
+  );
 }
 
 /**
