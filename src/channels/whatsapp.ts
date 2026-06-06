@@ -314,6 +314,11 @@ registerChannelAdapter('whatsapp', {
 
     // Sent message cache for retry/re-encrypt requests
     const sentMessageCache = new Map<string, any>();
+    // Inbound text by platform message id — lets a reaction resolve WHAT was
+    // reacted to even when the target was a user message (the bot's own
+    // messages resolve via sentMessageCache). Small FIFO cap.
+    const inboundTextCache = new Map<string, string>();
+    const INBOUND_TEXT_CACHE_MAX = 300;
 
     // Group metadata cache with TTL
     const groupMetadataCache = new Map<string, { metadata: GroupMetadata; expiresAt: number }>();
@@ -725,6 +730,58 @@ registerChannelAdapter('whatsapp', {
             const timestamp = new Date(Number(msg.messageTimestamp) * 1000).toISOString();
             const isGroup = chatJid.endsWith('@g.us');
 
+            // --- Reactions ---------------------------------------------------
+            // WhatsApp delivers emoji reactions as reactionMessage protocol
+            // messages (no text, no attachments) — they previously died at the
+            // empty-message skip below, so "react ✅ to remove the item"-style
+            // agent flows silently never heard anything. Surface them as a
+            // structured chat line, resolving the TARGET message's text from
+            // the sent-message cache (bot messages) or the inbound text cache
+            // (user messages) so the agent knows exactly what was reacted to.
+            const reactionMsg = (
+              normalized as { reactionMessage?: { key?: { id?: string; fromMe?: boolean }; text?: string } }
+            ).reactionMessage;
+            if (reactionMsg?.key?.id) {
+              if (msg.key.fromMe) continue; // the bot's own reactions never route
+              const emoji = reactionMsg.text || '';
+              const targetId = reactionMsg.key.id;
+              const targetFromMe = reactionMsg.key.fromMe === true;
+              const cached = targetFromMe ? sentMessageCache.get(targetId) : undefined;
+              const cachedText = cached
+                ? cached.conversation || cached.extendedTextMessage?.text || cached.imageMessage?.caption || ''
+                : (inboundTextCache.get(targetId) ?? '');
+              const snippet = String(cachedText).slice(0, 140);
+
+              const rawReactSender = msg.key.participant || msg.key.remoteJid || '';
+              const reactSender = rawReactSender.endsWith('@lid')
+                ? await translateJid(rawReactSender, msg.key.participantAlt)
+                : rawReactSender;
+              const reactSenderName = msg.pushName || reactSender.split('@')[0];
+
+              const reactionText = emoji
+                ? `[reaction] ${reactSenderName} reacted ${emoji} to ${targetFromMe ? 'your message' : 'a message'}${snippet ? `: "${snippet}"` : ` (id ${targetId})`}`
+                : `[reaction] ${reactSenderName} removed their reaction from ${targetFromMe ? 'your message' : 'a message'}${snippet ? `: "${snippet}"` : ''}`;
+
+              setupConfig.onInbound(chatJid, null, {
+                id: msg.key.id || `wa-react-${Date.now()}`,
+                kind: 'chat',
+                isMention: computeIsMention(isGroup, false),
+                isGroup,
+                content: {
+                  text: reactionText,
+                  sender: reactSender,
+                  senderName: reactSenderName,
+                  fromMe: false,
+                  isBotMessage: false,
+                  isGroup,
+                  chatJid,
+                  reaction: { emoji, targetId, targetFromMe, targetText: snippet || null },
+                },
+                timestamp,
+              });
+              continue;
+            }
+
             // Notify metadata for group discovery
             setupConfig.onMetadata(chatJid, undefined, isGroup);
 
@@ -745,6 +802,16 @@ registerChannelAdapter('whatsapp', {
 
             // Skip empty protocol messages (no text and no attachments)
             if (!content && attachments.length === 0) continue;
+
+            // Remember this message's text so a later reaction to it can say
+            // what it pointed at.
+            if (msg.key.id && content) {
+              inboundTextCache.set(msg.key.id, content.slice(0, 140));
+              if (inboundTextCache.size > INBOUND_TEXT_CACHE_MAX) {
+                const oldest = inboundTextCache.keys().next().value!;
+                inboundTextCache.delete(oldest);
+              }
+            }
 
             // Resolve sender: in groups, participant may be LID — use participantAlt
             const rawSender = msg.key.participant || msg.key.remoteJid || '';
